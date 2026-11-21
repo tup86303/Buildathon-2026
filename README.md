@@ -32,7 +32,7 @@ Python sources and type information, and unpacks the team's measured coverage
 map. Build-time inputs include the organizer's starter kit and SQLGlot (MIT).
 The source archive contains the upstream license.
 
-We collected the map on Windows with SQLGlot's executor integration enabled.
+The selector uses Windows line coverage and the union of Windows and Linux file-reader observations. We collected the Windows map with SQLGlot's executor integration enabled.
 It combines per-test line coverage, recorded file reads, and separate traces
 for worker processes. Worker traces include result serialization, which can
 execute SQLGlot code after the worker function returns. Platform or dependency
@@ -52,6 +52,8 @@ reading the file still run.
 The scheduler sorts selected tests by duration and tries up to eight worker
 counts. It skips counts whose best possible cost already exceeds or ties the
 best schedule found. Each new test goes to the least-loaded worker.
+
+Before selection, the image compiles reconstructed production Python without executing it. A compile failure selects the full manifest. Edits to scalar dialect settings also select baseline tests observed using that dialect or its subclasses. The offline dialect profile records positive evidence only.
 
 ## Try it
 
@@ -73,7 +75,7 @@ Push to a public GitHub repository with the `Dockerfile` at its top, then enter 
 ## Rules
 
 - Submit your own team's repository. A submission with the same repository, commit or archive as another team's is disqualified, the later one.
-- Your build may download only from public package registries: PyPI, npm, Docker Hub, GitHub releases at a fixed tag, and sqlglot’s own repository at the pinned commit. Nothing from an address your team controls. The final rebuilds every image after the cutoff, so anything else could change a submission after the deadline.
+- Your build may download only from public package registries: PyPI, npm, Docker Hub, GitHub releases at a fixed tag, and sqlglotâ€™s own repository at the pinned commit. Nothing from an address your team controls. The final rebuilds every image after the cutoff, so anything else could change a submission after the deadline.
 - No answers worked out ahead of time and looked up by patch: no table from a patch, or from a kind of edit, to the tests it breaks. Maps built from the pinned commit (coverage, imports, fixtures) are allowed. Top entries are read.
 - Only the final counts. The practice board carries no prize.
 

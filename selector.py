@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import gzip
 import json
 import re
 import sys
@@ -143,6 +145,19 @@ def _fixture_tests(path: str, access: dict, test_ids: list[str]) -> set[str]:
     return result
 
 
+def _scalar_edit(change):
+    for line in change["removed"]:
+        try:
+            nodes = ast.parse(line.strip()).body
+            if len(nodes) == 1 and isinstance(nodes[0], (ast.Assign, ast.AnnAssign)):
+                value = ast.literal_eval(nodes[0].value)
+                if isinstance(value, (bool, str, int, float)) or value is None:
+                    return True
+        except (ValueError, SyntaxError):
+            continue
+    return False
+
+
 def _changed_source_tests(change: dict, coverage_map: dict, test_ids: list[str], index=None) -> set[str]:
     path = _normalized(change["old"] or change["new"])
     if path.startswith("tests/fixtures/"):
@@ -177,6 +192,8 @@ def _changed_source_tests(change: dict, coverage_map: dict, test_ids: list[str],
             # Module-scope insertions can affect any consumer of this file.
             affected = set(coverage_map.get("source", {}).get(path, {}))
         selected.update(affected)
+    if not in_body and path.startswith("sqlglot/dialects/") and _scalar_edit(change):
+        selected.update(coverage_map.get("dialect_users", {}).get(path, ()))
     dialect_key = re.sub(r"[^a-z0-9]", "", Path(path).stem.lower())
     selected.update(coverage_map.get("dialect_tests", {}).get(dialect_key, []))
     selected.update(_module_tests(path, test_ids))
@@ -191,7 +208,10 @@ def _select_tests(
     for change in changes:
         path = _normalized(change["old"] or change["new"])
         selected.update(coverage_map.get("access", {}).get(path, ()))
-        if index is None or not index.equivalent(change):
+        analysis = index.analyze(change) if index is not None else "unknown"
+        if analysis == "invalid":
+            return tests
+        if analysis != "equivalent":
             selected.update(_changed_source_tests(change, coverage_map, ids, index))
     return [test for test in tests if test["id"] in selected]
 
@@ -234,6 +254,8 @@ def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ids = [test["id"] for test in tests]
     coverage_map = json.loads((APP / "coverage-map.json").read_text())
+    profile = json.loads(gzip.decompress((APP / "dialect-profile.json.gz").read_bytes()))
+    coverage_map["dialect_users"] = profile["dialect_tests"]
     if "line_index" in coverage_map:
         coverage_map["source"] = {p: LineIndex(v) for p, v in coverage_map.pop("line_index").items()}
     index = SourceIndex(APP / "source-index.zip")

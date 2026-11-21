@@ -63,17 +63,12 @@ class SourceIndex:
         text = self.archive.read(path).decode("utf-8").splitlines(keepends=True)
         return text, _signature(ast.parse("".join(text), type_comments=True), self.identity_classes, self.enum_fields)
 
-    def equivalent(self, change):
+    def reconstruct(self, change):
         path = change["old"]
         if path != change["new"] or not path.endswith(".py") or not change["hunks"]:
-            return False
-        # An inexpensive prefilter. The complete module comparison makes the decision.
-        edits = change["added"] + change["removed"]
-        if any(s.strip() and not s.lstrip().startswith("#") for s in edits):
-            if not any("None" in s or " is " in s for s in edits):
-                return False
+            return None
         try:
-            lines, before = self.original(path)
+            lines = self.archive.read(path).decode("utf-8").splitlines(keepends=True)
             output = []
             cursor = 0
             for start, old_count, new_count, hunk in change["hunks"]:
@@ -82,12 +77,33 @@ class SourceIndex:
                 new = [s[1:] for s in hunk if s[0] in " +"]
                 if (offset < cursor or len(old) != old_count or len(new) != new_count
                         or old != [s.rstrip("\r\n") for s in lines[offset:offset+old_count]]):
-                    return False
+                    return None
                 output.extend(lines[cursor:offset])
                 output.extend(s + "\n" for s in new)
                 cursor = offset + old_count
             output.extend(lines[cursor:])
-            tree = ast.parse("".join(output), type_comments=True)
-            return _signature(tree, self.identity_classes, self.enum_fields) == before
-        except (KeyError, SyntaxError, UnicodeError, ValueError, RecursionError):
-            return False
+            return "".join(output).encode("utf-8")
+        except (KeyError, UnicodeError):
+            return None
+
+    def analyze(self, change):
+        raw = self.reconstruct(change)
+        if raw is None:
+            return "unknown"
+        try:
+            compile(raw, change["old"], "exec", dont_inherit=True)
+        except (SyntaxError, ValueError, UnicodeError):
+            return "invalid"
+        # An inexpensive prefilter. The complete module comparison makes the decision.
+        edits = change["added"] + change["removed"]
+        if any(s.strip() and not s.lstrip().startswith("#") for s in edits):
+            if not any("None" in s or " is " in s for s in edits):
+                return "changed"
+        try:
+            tree = ast.parse(raw, type_comments=True)
+        except (SyntaxError, ValueError, RecursionError):
+            return "changed"
+        _, before = self.original(change["old"])
+        if _signature(tree, self.identity_classes, self.enum_fields) == before:
+            return "equivalent"
+        return "changed"
