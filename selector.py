@@ -81,6 +81,24 @@ def _tests_covering_region(source: dict, path: str, regions: list[tuple[int, int
     return result
 
 
+def _function_tests(path: str, changed_lines: set[int], coverage_map: dict) -> set[str]:
+    functions = coverage_map.get("functions", {})
+    matching = [
+        function
+        for function in functions.get(path, [])
+        if any(function["start"] <= line <= function["end"] for line in changed_lines)
+    ]
+    if not matching:
+        return set()
+
+    source = coverage_map.get("source", {})
+    return _tests_covering_region(
+        source,
+        path,
+        [(function["start"], function["end"]) for function in matching],
+    )
+
+
 def _module_tests(path: str, test_ids: list[str]) -> set[str]:
     path = _normalized(path)
     if path.startswith("tests/"):
@@ -116,30 +134,24 @@ def _fixture_tests(path: str, access: dict, test_ids: list[str]) -> set[str]:
 
 def _related_tests(path: str, test_ids: list[str]) -> set[str]:
     path = _normalized(path)
-    if not path.startswith("sqlglot/"):
+    if path == "sqlglot/dialects/dialect.py":
+        return {
+            test_id for test_id in test_ids
+            if test_id.endswith(
+                (
+                    "::test_normalize",
+                    "::test_normalize_identifiers",
+                    "::test_preserve_original_names",
+                )
+            )
+        }
+    if not path.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/typing/")):
         return set()
 
-    related: set[str] = set()
-    if (
-        path.startswith(("sqlglot/optimizer/", "sqlglot/parsers/", "sqlglot/dialects/"))
-        or path.startswith("sqlglot/typing/")
-        or path == "sqlglot/serde.py"
-    ):
-        related.update(
-            test_id for test_id in test_ids
-            if test_id.startswith("tests/test_optimizer.py::")
-            or test_id.startswith("tests/optimizer/")
-        )
-
-    for package in ("dialects", "parsers"):
-        prefix = f"sqlglot/{package}/"
-        if path.startswith(prefix):
-            stem = Path(path).stem
-            related.update(
-                test_id for test_id in test_ids
-                if test_id.startswith(f"tests/dialects/test_{stem}.py::")
-            )
-    return related
+    return {
+        test_id for test_id in test_ids
+        if test_id.startswith(f"tests/dialects/test_{Path(path).stem}.py::")
+    }
 
 
 def _changed_source_tests(change: dict, coverage_map: dict, test_ids: list[str]) -> set[str]:
@@ -151,36 +163,41 @@ def _changed_source_tests(change: dict, coverage_map: dict, test_ids: list[str])
     if not path.startswith("sqlglot/") or not path.endswith(".py"):
         return _fixture_tests(path, coverage_map.get("access", {}), test_ids)
 
-    source = coverage_map.get("source", {})
     old_lines = change["old_lines"]
     new_lines = change["new_lines"]
-    regions: list[tuple[int, int]] = []
-    scopes = coverage_map.get("scopes", {}).get(path, [])
-
-    for line in old_lines:
-        containing = [(start, end) for start, end in scopes if start <= line <= end]
-        if containing:
-            regions.append(min(containing, key=lambda span: span[1] - span[0]))
-        else:
-            regions.append((line, line))
-
-    if not old_lines and new_lines:
-        # Added lines have no baseline coverage; use the nearest old source line.
-        anchor = max(1, min(new_lines) - 1)
-        containing = [(start, end) for start, end in scopes if start <= anchor <= end]
-        regions.extend(containing or [(max(1, anchor - 1), anchor + 1)])
-
-    selected = _tests_covering_region(source, path, regions)
+    changed_lines = old_lines or new_lines
+    selected = _tests_covering_region(
+        coverage_map.get("source", {}),
+        path,
+        [(line, line) for line in changed_lines],
+    )
+    if not selected:
+        selected.update(_function_tests(path, changed_lines, coverage_map))
+    selected.update(_related_tests(path, test_ids))
+    dialect_key = re.sub(r"[^a-z0-9]", "", Path(path).stem.lower())
+    selected.update(coverage_map.get("dialect_tests", {}).get(dialect_key, []))
+    if path == "sqlglot/serde.py":
+        selected.update(
+            test_id for test_id in test_ids
+            if test_id.startswith("tests/test_optimizer.py::")
+            or test_id.startswith("tests/optimizer/")
+        )
+    if path.startswith("sqlglot/optimizer/"):
+        selected.update(
+            test_id for test_id in test_ids
+            if test_id.endswith(("::test_tpcds", "::test_tpch"))
+        )
+        selected.update(
+            test_id for test_id in test_ids
+            if test_id.endswith(f"::test_{Path(path).stem}")
+        )
+        if path.endswith("/eliminate_joins.py"):
+            selected.update(
+                test_id for test_id in test_ids
+                if test_id.endswith("::test_optimize")
+            )
     if not selected:
         selected = _module_tests(path, test_ids)
-    if not selected:
-        selected = set(source.get(path, {}))
-    selected.update(_related_tests(path, test_ids))
-    if not selected and path.startswith("sqlglot/dialects/"):
-        selected = {
-            test_id for test_id in test_ids
-            if test_id.startswith("tests/dialects/")
-        }
     return selected
 
 
@@ -191,8 +208,32 @@ def _test_number_map(tests: list[dict]) -> dict[str, int]:
 def _select_tests(patch: Path, coverage_map: dict, tests: list[dict]) -> list[dict]:
     ids = [test["id"] for test in tests]
     selected: set[str] = set()
-    for change in _patch_changes(patch):
+    changes = _patch_changes(patch)
+    executor_relevant = False
+    for change in changes:
+        path = _normalized(change["old"] or change["new"])
+        changed_code = any(
+            line.strip() and not line.lstrip().startswith("#")
+            for line in change["added"] + change["removed"]
+        )
+        executor_relevant |= (
+            path.startswith("sqlglot/executor/")
+            or path == "sqlglot/serde.py"
+            or (path.startswith("sqlglot/optimizer/") and changed_code)
+            or (
+                path.startswith("tests/fixtures/")
+                and any(
+                    test_id.startswith("tests/test_executor.py::")
+                    for test_id in _fixture_tests(path, coverage_map.get("access", {}), ids)
+                )
+            )
+        )
         selected.update(_changed_source_tests(change, coverage_map, ids))
+    if not executor_relevant:
+        selected = {
+            test_id for test_id in selected
+            if not test_id.startswith("tests/test_executor.py::")
+        }
     number_by_id = _test_number_map(tests)
     return [test for test in tests if test["id"] in selected and test["id"] in number_by_id]
 

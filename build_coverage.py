@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -17,21 +18,33 @@ def _relative(path: str, root: Path) -> str | None:
         return None
 
 
-def _scopes(root: Path) -> dict[str, list[list[int]]]:
-    result: dict[str, list[list[int]]] = {}
+def _function_map(root: Path) -> dict[str, list[dict]]:
+    result: dict[str, list[dict]] = {}
     for path in (root / "sqlglot").rglob("*.py"):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))
         except (OSError, SyntaxError):
             continue
-        spans: list[list[int]] = []
+        functions: list[dict] = []
         for node in ast.walk(tree):
-            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 starts = [node.lineno, *(item.lineno for item in node.decorator_list)]
-                spans.append([min(starts), node.end_lineno or node.lineno])
+                calls = {
+                    call.func.id if isinstance(call.func, ast.Name) else call.func.attr
+                    for call in ast.walk(node)
+                    if isinstance(call, ast.Call) and isinstance(call.func, (ast.Name, ast.Attribute))
+                }
+                functions.append(
+                    {
+                        "start": min(starts),
+                        "end": node.end_lineno or node.lineno,
+                        "name": node.name,
+                        "calls": sorted(calls),
+                    }
+                )
         relative = _relative(str(path), root)
         if relative:
-            result[relative] = spans
+            result[relative] = functions
     return result
 
 
@@ -70,15 +83,33 @@ def _access(path: Path, root: Path) -> dict[str, list[str]]:
     return {file: sorted(test_ids) for file, test_ids in result.items()}
 
 
+def _dialect_tests(access: dict[str, list[str]], root: Path) -> dict[str, list[str]]:
+    result: dict[str, set[str]] = defaultdict(set)
+    pattern = re.compile(r"^\s*#\s*dialect:\s*([a-z0-9_ -]+)\s*$", re.IGNORECASE | re.MULTILINE)
+    for relative, test_ids in access.items():
+        if not relative.startswith("tests/fixtures/"):
+            continue
+        try:
+            fixture = (root / relative).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        for dialect in pattern.findall(fixture):
+            key = re.sub(r"[^a-z0-9]", "", dialect.lower())
+            result[key].update(test_ids)
+    return {dialect: sorted(test_ids) for dialect, test_ids in result.items()}
+
+
 def main() -> None:
     coverage_file = Path(sys.argv[1])
     access_file = Path(sys.argv[2])
     root = Path(sys.argv[3]).resolve()
     output = Path(sys.argv[4])
+    access = _access(access_file, root)
     result = {
         "source": _coverage(coverage_file, root),
-        "access": _access(access_file, root),
-        "scopes": _scopes(root),
+        "access": access,
+        "dialect_tests": _dialect_tests(access, root),
+        "functions": _function_map(root),
     }
     output.write_text(json.dumps(result, separators=(",", ":")), encoding="utf-8")
     os.chmod(output, 0o644)
