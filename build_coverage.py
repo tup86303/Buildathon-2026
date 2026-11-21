@@ -42,11 +42,15 @@ def _function_map(root: Path) -> dict[str, list[dict]]:
 
 
 def _coverage(path: Path, root: Path) -> dict[str, dict[str, list[int]]]:
-    from coverage import Coverage
+    from coverage import Coverage, CoverageData
 
     coverage = Coverage(data_file=str(path))
     coverage.load()
     data = coverage.get_data()
+    for worker_file in path.parent.glob(path.name + "-pool.*"):
+        worker = CoverageData(basename=str(worker_file))
+        worker.read()
+        data.update(worker)
     result: dict[str, dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
     for measured_file in data.measured_files():
         relative = _relative(measured_file, root)

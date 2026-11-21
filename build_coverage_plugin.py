@@ -6,9 +6,11 @@ import builtins
 import io
 import os
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import pytest
+from pool_coverage import run_with_context
 
 ROOT = Path(os.environ["SQLGLOT_ROOT"]).resolve()
 OUTPUT = Path(f"{os.environ['COVERAGE_ACCESS_FILE']}.{os.environ.get('PYTEST_XDIST_WORKER', 'main')}")
@@ -17,6 +19,13 @@ accesses: dict[str, set[str]] = defaultdict(set)
 
 _open = builtins.open
 _io_open = io.open
+_submit = ProcessPoolExecutor.submit
+
+
+def _tracked_submit(pool, function, /, *args, **kwargs):
+    if current_test is None:
+        return _submit(pool, function, *args, **kwargs)
+    return _submit(pool, run_with_context, current_test, function, args, kwargs)
 
 
 def _record(file: object) -> None:
@@ -42,6 +51,7 @@ def _tracked_io_open(file: object, *args: object, **kwargs: object):
 
 builtins.open = _tracked_open
 io.open = _tracked_io_open
+ProcessPoolExecutor.submit = _tracked_submit
 
 
 @pytest.hookimpl(tryfirst=True)

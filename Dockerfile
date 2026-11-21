@@ -11,7 +11,7 @@ RUN python -m pip install --no-cache-dir -r /tmp/requirements.lock
 
 COPY --from=source /sqlglot /sqlglot
 
-COPY build_coverage.py build_coverage_plugin.py /app/
+COPY build_coverage.py build_coverage_plugin.py pool_coverage.py /app/
 ENV PYTHONPATH=/app:/sqlglot
 ENV SQLGLOT_ROOT=/sqlglot
 ENV COVERAGE_FILE=/tmp/.coverage
@@ -19,6 +19,7 @@ ENV COVERAGE_ACCESS_FILE=/tmp/coverage-access.tsv
 ENV OPENBLAS_NUM_THREADS=1
 ENV OMP_NUM_THREADS=1
 ENV MKL_NUM_THREADS=1
+ENV PYTHON_CPU_COUNT=2
 
 RUN cd /sqlglot \
     && SKIP_INTEGRATION=0 pytest -q -n 4 --cov=sqlglot --cov-context=test \

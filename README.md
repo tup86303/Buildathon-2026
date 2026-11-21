@@ -29,8 +29,10 @@ Lower is better. [SCORING.md](SCORING.md) has the exact rules; in short:
 
 During the image build, the Dockerfile checks out sqlglot at the pinned base
 revision and runs its tests with per-test coverage contexts. It saves the
-source lines measured during test setup, execution and teardown, plus non-Python files read while each test is
-running. At runtime, the selector parses each patch and schedules tests that
+source lines measured during test setup, execution and teardown, plus non-Python
+files read while each test is running. Process-pool tasks record the submitting
+test's ID in a separate coverage database per worker. The build merges these
+records with coverage from the pytest process. At runtime, the selector schedules tests that
 execute changed source lines, or the changed function when no test covers the
 exact lines. For insertions it finds the enclosing functions at the gap in the
 original file. If neither neighboring line has a mapped function with coverage,
