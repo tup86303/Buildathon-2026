@@ -10,7 +10,6 @@ from bisect import bisect_left
 from pathlib import Path, PurePosixPath
 from source_analysis import SourceIndex
 from coverage_index import LineIndex
-from verifier import verify_and_prune
 
 DATA = Path("/data")
 APP = Path("/app")
@@ -493,15 +492,10 @@ def _changed_source_tests(
                 d_rel = f"sqlglot/dialects/{Path(path).name}"
                 d_users = dp.get("dialect_tests", {}).get(d_rel)
                 if d_users:
-                    # test_generator_memory only instantiates dialect.generator() in a loop (no tokenizer/parser)
-                    is_gen_file = path.startswith("sqlglot/generators/")
-                    if not is_gen_file:
-                        selected.update(t for t in d_users if not t.endswith("::test_generator_memory"))
-                    else:
-                        selected.update(d_users)
+                    selected.update(d_users)
                     selected.update(dp.get("unprofiled", ()))
                 if path.startswith("sqlglot/typing/"):
-                    selected.update(t for t in test_ids if t.endswith(("::test_annotate_types", "::test_annotate_funcs")))
+                    selected.update(_dependent_tests(path, coverage_map, test_ids, index))
             if index is not None:
                 bindings = index.scalar_bindings.get(path, {})
                 for name in {bindings.get(str(line)) for line in changed_lines} - {None}:
@@ -525,13 +519,10 @@ def _changed_source_tests(
                 d_rel = f"sqlglot/dialects/{Path(path).name}"
                 d_users = dp.get("dialect_tests", {}).get(d_rel)
                 if d_users:
-                    if not path.startswith("sqlglot/generators/"):
-                        affected.update(t for t in d_users if not t.endswith("::test_generator_memory"))
-                    else:
-                        affected.update(d_users)
+                    affected.update(d_users)
                     affected.update(dp.get("unprofiled", ()))
                 if path.startswith("sqlglot/typing/"):
-                    affected.update(t for t in test_ids if t.endswith(("::test_annotate_types", "::test_annotate_funcs")))
+                    affected.update(_dependent_tests(path, coverage_map, test_ids, index))
         selected.update(affected)
 
     selected.update(base_extra)
@@ -650,30 +641,16 @@ def _split(tests: list[dict]) -> list[list[int]]:
     return best_workers
 
 
-def _schedule_cost_ms(workers: list[list[int]], dur_map: dict[int, int]) -> int:
-    if not workers:
-        return 0
-    return max(sum(dur_map[n] for n in w) for w in workers) + 2_000 * len(workers)
-
-
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ids = [test["id"] for test in tests]
-    dur_map = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
     coverage_map = json.loads((APP / "coverage-map.json").read_text())
     if "line_index" in coverage_map:
         coverage_map["source"] = coverage_map.pop("line_index")
     index = SourceIndex(APP / "source-index.zip")
-    sqlglot_root = APP / "sqlglot_src"
     for patch in sorted((DATA / "commits").glob("*.patch")):
-        changes = _patch_changes(patch)
         selected = _select_tests(patch, coverage_map, tests, ids, index)
         workers = _split(selected)
-        if selected and sqlglot_root.exists():
-            est_ms = _schedule_cost_ms(workers, dur_map)
-            pruned = verify_and_prune(sqlglot_root, changes, index, selected, est_ms)
-            if len(pruned) != len(selected):
-                workers = _split(pruned)
         print(json.dumps({"commit": patch.stem, "workers": workers}))
     print("selected tests using pinned-source coverage", file=sys.stderr)
 
