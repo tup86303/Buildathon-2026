@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+from bisect import bisect_left
 from pathlib import Path, PurePosixPath
 
 DATA = Path("/data")
@@ -16,7 +17,8 @@ def _patch_changes(patch: Path) -> list[dict]:
     changes: list[dict] = []
     current: dict | None = None
     old_line = 0
-    new_line = 0
+    in_hunk = False
+    replacing = False
     for line in patch.read_text(encoding="utf-8", errors="replace").splitlines():
         if line.startswith("diff --git "):
             parts = line.split()
@@ -26,32 +28,36 @@ def _patch_changes(patch: Path) -> list[dict]:
                 "old": "" if old_path == "/dev/null" else old_path,
                 "new": "" if new_path == "/dev/null" else new_path,
                 "old_lines": set(),
-                "new_lines": set(),
+                "insertion_anchors": set(),
                 "added": [],
                 "removed": [],
             }
             changes.append(current)
+            in_hunk = False
             continue
         if current is None:
             continue
         match = HUNK.match(line)
         if match:
-            old_line = int(match.group(1))
-            new_line = int(match.group(3))
+            # A zero-length old range names the line BEFORE the insertion.
+            old_line = int(match.group(1)) + (match.group(2) == "0")
+            in_hunk = True
+            replacing = False
             continue
-        if line.startswith("\\"):
+        if not in_hunk or line.startswith("\\"):
             continue
-        if line.startswith("+") and not line.startswith("+++"):
-            current["new_lines"].add(new_line)
+        if line.startswith("+"):
+            if not replacing:
+                current["insertion_anchors"].add(old_line)
             current["added"].append(line[1:])
-            new_line += 1
-        elif line.startswith("-") and not line.startswith("---"):
+        elif line.startswith("-"):
+            replacing = True
             current["old_lines"].add(old_line)
             current["removed"].append(line[1:])
             old_line += 1
         elif line.startswith(" "):
             old_line += 1
-            new_line += 1
+            replacing = False
     return changes
 
 
@@ -69,13 +75,9 @@ def _tests_covering_region(source: dict, path: str, regions: list[tuple[int, int
 
     result: set[str] = set()
     for test_id, lines in source.get(path, {}).items():
-        region_index = 0
-        for line in lines:
-            while region_index < len(merged) and merged[region_index][1] < line:
-                region_index += 1
-            if region_index == len(merged):
-                break
-            if merged[region_index][0] <= line:
+        for start, end in merged:
+            index = bisect_left(lines, start)
+            if index < len(lines) and lines[index] <= end:
                 result.add(test_id)
                 break
     return result
@@ -163,9 +165,7 @@ def _changed_source_tests(change: dict, coverage_map: dict, test_ids: list[str])
     if not path.startswith("sqlglot/") or not path.endswith(".py"):
         return _fixture_tests(path, coverage_map.get("access", {}), test_ids)
 
-    old_lines = change["old_lines"]
-    new_lines = change["new_lines"]
-    changed_lines = old_lines or new_lines
+    changed_lines = change["old_lines"]
     selected = _tests_covering_region(
         coverage_map.get("source", {}),
         path,
@@ -173,6 +173,15 @@ def _changed_source_tests(change: dict, coverage_map: dict, test_ids: list[str])
     )
     if not selected:
         selected.update(_function_tests(path, changed_lines, coverage_map))
+    for anchor in change["insertion_anchors"]:
+        # No baseline test could execute the added lines. Use the enclosing
+        # function on either side of the gap, including at a function boundary.
+        neighbors = {max(1, anchor - 1), anchor}
+        affected = _function_tests(path, neighbors, coverage_map)
+        if not affected:
+            # Module-scope insertions can affect any consumer of this file.
+            affected = set(coverage_map.get("source", {}).get(path, {}))
+        selected.update(affected)
     selected.update(_related_tests(path, test_ids))
     dialect_key = re.sub(r"[^a-z0-9]", "", Path(path).stem.lower())
     selected.update(coverage_map.get("dialect_tests", {}).get(dialect_key, []))
@@ -201,12 +210,9 @@ def _changed_source_tests(change: dict, coverage_map: dict, test_ids: list[str])
     return selected
 
 
-def _test_number_map(tests: list[dict]) -> dict[str, int]:
-    return {test["id"]: test["number"] for test in tests}
-
-
-def _select_tests(patch: Path, coverage_map: dict, tests: list[dict]) -> list[dict]:
-    ids = [test["id"] for test in tests]
+def _select_tests(
+    patch: Path, coverage_map: dict, tests: list[dict], ids: list[str],
+) -> list[dict]:
     selected: set[str] = set()
     changes = _patch_changes(patch)
     executor_relevant = False
@@ -217,7 +223,8 @@ def _select_tests(patch: Path, coverage_map: dict, tests: list[dict]) -> list[di
             for line in change["added"] + change["removed"]
         )
         executor_relevant |= (
-            path.startswith("sqlglot/executor/")
+            path == "tests/test_executor.py"
+            or path.startswith("sqlglot/executor/")
             or path == "sqlglot/serde.py"
             or (path.startswith("sqlglot/optimizer/") and changed_code)
             or (
@@ -234,29 +241,37 @@ def _select_tests(patch: Path, coverage_map: dict, tests: list[dict]) -> list[di
             test_id for test_id in selected
             if not test_id.startswith("tests/test_executor.py::")
         }
-    number_by_id = _test_number_map(tests)
-    return [test for test in tests if test["id"] in selected and test["id"] in number_by_id]
+    return [test for test in tests if test["id"] in selected]
 
 
 def _split(tests: list[dict]) -> list[list[int]]:
     if not tests:
         return []
 
-    durations = [int(test["seconds"] * 1000 + 0.5) for test in tests]
+    ordered = sorted(
+        ((test["number"], int(test["seconds"] * 1000 + 0.5)) for test in tests),
+        key=lambda item: (-item[1], item[0]),
+    )
+    total_duration = sum(duration for _, duration in ordered)
+    longest = ordered[0][1]
     best_workers: list[list[int]] = []
     best_cost: int | None = None
     for worker_count in range(1, min(8, len(tests)) + 1):
+        worker_cost = 2_000 * worker_count
+        if best_cost is not None:
+            if longest + worker_cost >= best_cost:
+                break
+            average = (total_duration + worker_count - 1) // worker_count
+            if average + worker_cost >= best_cost:
+                continue
+
         workers: list[list[int]] = [[] for _ in range(worker_count)]
         loads = [0] * worker_count
-        ordered = sorted(
-            zip(tests, durations),
-            key=lambda item: (-item[1], item[0]["number"]),
-        )
-        for test, duration in ordered:
-            worker = min(range(worker_count), key=loads.__getitem__)
-            workers[worker].append(test["number"])
+        for number, duration in ordered:
+            worker = loads.index(min(loads))
+            workers[worker].append(number)
             loads[worker] += duration
-        cost = max(loads) + 2_000 * worker_count
+        cost = max(loads) + worker_cost
         if best_cost is None or cost < best_cost:
             best_cost = cost
             best_workers = workers
@@ -265,9 +280,10 @@ def _split(tests: list[dict]) -> list[list[int]]:
 
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
+    ids = [test["id"] for test in tests]
     coverage_map = json.loads((APP / "coverage-map.json").read_text())
     for patch in sorted((DATA / "commits").glob("*.patch")):
-        selected = _select_tests(patch, coverage_map, tests)
+        selected = _select_tests(patch, coverage_map, tests, ids)
         print(json.dumps({"commit": patch.stem, "workers": _split(selected)}))
     print("selected tests using pinned-source coverage", file=sys.stderr)
 
