@@ -7,6 +7,8 @@ import re
 import sys
 from bisect import bisect_left
 from pathlib import Path, PurePosixPath
+from source_analysis import SourceIndex
+from coverage_index import LineIndex
 
 DATA = Path("/data")
 APP = Path("/app")
@@ -31,6 +33,7 @@ def _patch_changes(patch: Path) -> list[dict]:
                 "insertion_anchors": set(),
                 "added": [],
                 "removed": [],
+                "hunks": [],
             }
             changes.append(current)
             in_hunk = False
@@ -39,6 +42,7 @@ def _patch_changes(patch: Path) -> list[dict]:
             continue
         match = HUNK.match(line)
         if match:
+            current["hunks"].append((int(match[1]), int(match[2] or 1), int(match[4] or 1), []))
             # A zero-length old range names the line BEFORE the insertion.
             old_line = int(match.group(1)) + (match.group(2) == "0")
             in_hunk = True
@@ -46,6 +50,8 @@ def _patch_changes(patch: Path) -> list[dict]:
             continue
         if not in_hunk or line.startswith("\\"):
             continue
+        if line[:1] in {" ", "+", "-"}:
+            current["hunks"][-1][3].append(line)
         if line.startswith("+"):
             if not replacing:
                 current["insertion_anchors"].add(old_line)
@@ -66,6 +72,9 @@ def _normalized(path: str) -> str:
 
 
 def _tests_covering_region(source: dict, path: str, regions: list[tuple[int, int]]) -> set[str]:
+    index = source.get(path)
+    if isinstance(index, LineIndex):
+        return index.covering(regions)
     merged: list[list[int]] = []
     for start, end in sorted(regions):
         if merged and start <= merged[-1][1] + 1:
@@ -134,29 +143,7 @@ def _fixture_tests(path: str, access: dict, test_ids: list[str]) -> set[str]:
     return result
 
 
-def _related_tests(path: str, test_ids: list[str]) -> set[str]:
-    path = _normalized(path)
-    if path == "sqlglot/dialects/dialect.py":
-        return {
-            test_id for test_id in test_ids
-            if test_id.endswith(
-                (
-                    "::test_normalize",
-                    "::test_normalize_identifiers",
-                    "::test_preserve_original_names",
-                )
-            )
-        }
-    if not path.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/typing/")):
-        return set()
-
-    return {
-        test_id for test_id in test_ids
-        if test_id.startswith(f"tests/dialects/test_{Path(path).stem}.py::")
-    }
-
-
-def _changed_source_tests(change: dict, coverage_map: dict, test_ids: list[str]) -> set[str]:
+def _changed_source_tests(change: dict, coverage_map: dict, test_ids: list[str], index=None) -> set[str]:
     path = _normalized(change["old"] or change["new"])
     if path.startswith("tests/fixtures/"):
         return _fixture_tests(path, coverage_map.get("access", {}), test_ids)
@@ -166,11 +153,19 @@ def _changed_source_tests(change: dict, coverage_map: dict, test_ids: list[str])
         return _fixture_tests(path, coverage_map.get("access", {}), test_ids)
 
     changed_lines = change["old_lines"]
+    lines = set(changed_lines)
+    if index is not None:
+        starts = index.conditions.get(path, {})
+        lines.update(starts.get(str(line), line) for line in changed_lines)
     selected = _tests_covering_region(
-        coverage_map.get("source", {}),
-        path,
-        [(line, line) for line in changed_lines],
+        coverage_map.get("source", {}), path, [(line, line) for line in lines]
     )
+    functions = coverage_map.get("functions", {}).get(path, ())
+    in_body = changed_lines and all(
+        any(f["start"] < line <= f["end"] for f in functions) for line in changed_lines
+    )
+    if in_body and not change["insertion_anchors"] and change["added"] and change["removed"]:
+        return selected
     if not selected:
         selected.update(_function_tests(path, changed_lines, coverage_map))
     for anchor in change["insertion_anchors"]:
@@ -182,65 +177,22 @@ def _changed_source_tests(change: dict, coverage_map: dict, test_ids: list[str])
             # Module-scope insertions can affect any consumer of this file.
             affected = set(coverage_map.get("source", {}).get(path, {}))
         selected.update(affected)
-    selected.update(_related_tests(path, test_ids))
     dialect_key = re.sub(r"[^a-z0-9]", "", Path(path).stem.lower())
     selected.update(coverage_map.get("dialect_tests", {}).get(dialect_key, []))
-    if path == "sqlglot/serde.py":
-        selected.update(
-            test_id for test_id in test_ids
-            if test_id.startswith("tests/test_optimizer.py::")
-            or test_id.startswith("tests/optimizer/")
-        )
-    if path.startswith("sqlglot/optimizer/"):
-        selected.update(
-            test_id for test_id in test_ids
-            if test_id.endswith(("::test_tpcds", "::test_tpch"))
-        )
-        selected.update(
-            test_id for test_id in test_ids
-            if test_id.endswith(f"::test_{Path(path).stem}")
-        )
-        if path.endswith("/eliminate_joins.py"):
-            selected.update(
-                test_id for test_id in test_ids
-                if test_id.endswith("::test_optimize")
-            )
-    if not selected:
-        selected = _module_tests(path, test_ids)
+    selected.update(_module_tests(path, test_ids))
     return selected
 
 
 def _select_tests(
-    patch: Path, coverage_map: dict, tests: list[dict], ids: list[str],
+    patch: Path, coverage_map: dict, tests: list[dict], ids: list[str], index=None,
 ) -> list[dict]:
     selected: set[str] = set()
     changes = _patch_changes(patch)
-    executor_relevant = False
     for change in changes:
         path = _normalized(change["old"] or change["new"])
-        changed_code = any(
-            line.strip() and not line.lstrip().startswith("#")
-            for line in change["added"] + change["removed"]
-        )
-        executor_relevant |= (
-            path == "tests/test_executor.py"
-            or path.startswith("sqlglot/executor/")
-            or path == "sqlglot/serde.py"
-            or (path.startswith("sqlglot/optimizer/") and changed_code)
-            or (
-                path.startswith("tests/fixtures/")
-                and any(
-                    test_id.startswith("tests/test_executor.py::")
-                    for test_id in _fixture_tests(path, coverage_map.get("access", {}), ids)
-                )
-            )
-        )
-        selected.update(_changed_source_tests(change, coverage_map, ids))
-    if not executor_relevant:
-        selected = {
-            test_id for test_id in selected
-            if not test_id.startswith("tests/test_executor.py::")
-        }
+        selected.update(coverage_map.get("access", {}).get(path, ()))
+        if index is None or not index.equivalent(change):
+            selected.update(_changed_source_tests(change, coverage_map, ids, index))
     return [test for test in tests if test["id"] in selected]
 
 
@@ -282,8 +234,11 @@ def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ids = [test["id"] for test in tests]
     coverage_map = json.loads((APP / "coverage-map.json").read_text())
+    if "line_index" in coverage_map:
+        coverage_map["source"] = {p: LineIndex(v) for p, v in coverage_map.pop("line_index").items()}
+    index = SourceIndex(APP / "source-index.zip")
     for patch in sorted((DATA / "commits").glob("*.patch")):
-        selected = _select_tests(patch, coverage_map, tests, ids)
+        selected = _select_tests(patch, coverage_map, tests, ids, index)
         print(json.dumps({"commit": patch.stem, "workers": _split(selected)}))
     print("selected tests using pinned-source coverage", file=sys.stderr)
 

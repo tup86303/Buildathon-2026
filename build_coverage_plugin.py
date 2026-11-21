@@ -20,6 +20,13 @@ accesses: dict[str, set[str]] = defaultdict(set)
 _open = builtins.open
 _io_open = io.open
 _submit = ProcessPoolExecutor.submit
+_init_pool = ProcessPoolExecutor.__init__
+
+
+def _bounded_pool(pool, max_workers=None, *args, **kwargs):
+    if max_workers is None:
+        max_workers = int(os.environ.get("COVERAGE_POOL_WORKERS", "2"))
+    _init_pool(pool, max_workers, *args, **kwargs)
 
 
 def _tracked_submit(pool, function, /, *args, **kwargs):
@@ -35,8 +42,7 @@ def _record(file: object) -> None:
         relative = Path(os.fspath(file)).resolve().relative_to(ROOT).as_posix()
     except (OSError, TypeError, ValueError):
         return
-    if not relative.endswith(".py"):
-        accesses[relative].add(current_test)
+    accesses[relative].add(current_test)
 
 
 def _tracked_open(file: object, *args: object, **kwargs: object):
@@ -52,6 +58,7 @@ def _tracked_io_open(file: object, *args: object, **kwargs: object):
 builtins.open = _tracked_open
 io.open = _tracked_io_open
 ProcessPoolExecutor.submit = _tracked_submit
+ProcessPoolExecutor.__init__ = _bounded_pool
 
 
 @pytest.hookimpl(tryfirst=True)

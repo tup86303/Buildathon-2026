@@ -11,7 +11,8 @@ RUN python -m pip install --no-cache-dir -r /tmp/requirements.lock
 
 COPY --from=source /sqlglot /sqlglot
 
-COPY build_coverage.py build_coverage_plugin.py pool_coverage.py /app/
+COPY build_coverage.py build_coverage_plugin.py pool_coverage.py build_source_index.py /app/
+RUN python /app/build_source_index.py /sqlglot /app/source-index.zip
 ENV PYTHONPATH=/app:/sqlglot
 ENV SQLGLOT_ROOT=/sqlglot
 ENV COVERAGE_FILE=/tmp/.coverage
@@ -28,6 +29,7 @@ RUN cd /sqlglot \
        /sqlglot /app/coverage-map.json
 
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
-COPY selector.py /app/selector.py
+COPY --from=coverage /app/source-index.zip /app/source-index.zip
+COPY selector.py source_analysis.py coverage_index.py /app/
 COPY --from=coverage /app/coverage-map.json /app/coverage-map.json
 CMD ["python", "/app/selector.py"]

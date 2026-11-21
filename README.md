@@ -27,29 +27,31 @@ Lower is better. [SCORING.md](SCORING.md) has the exact rules; in short:
 
 ## Selection strategy
 
-The default image unpacks a checked-in coverage map from the pinned SQLGlot
-revision. It was collected on Windows with executor integration enabled and
-includes a second pass through the process-pool tests with child coverage.
-`Dockerfile.coverage` contains the Linux recipe for collecting a fresh map.
-Platform and dependency differences can change which lines a test reaches.
+The default Docker build fetches the pinned SQLGlot revision, packages its
+Python sources and type information, and unpacks the team's measured coverage
+map. Build-time inputs include the organizer's starter kit and SQLGlot (MIT).
+The source archive contains the upstream license.
 
-During the image build, the Dockerfile checks out sqlglot at the pinned base
-revision and runs its tests with per-test coverage contexts. It saves the
-source lines measured during test setup, execution and teardown, plus non-Python
-files read while each test is running. Process-pool tasks record the submitting
-test's ID in a separate coverage database per worker. The build merges these
-records with coverage from the pytest process. At runtime, the selector schedules tests that
-execute changed source lines, or the changed function when no test covers the
-exact lines. For insertions it finds the enclosing functions at the gap in the
-original file. If neither neighboring line has a mapped function with coverage,
-it includes tests that executed the file. Changed fixtures select tests that read them, and module-level
-edits fall back to tests for that module. Dialect and optimizer changes add
-targeted related tests; executor tests are excluded unless the patch touches
-executor behavior or a fixture they read. This mapping comes only from the
-pinned source and test run; it does not contain patch-specific answers.
+We collected the map on Windows with SQLGlot's executor integration enabled.
+It combines per-test line coverage, recorded file reads, and separate traces
+for worker processes. Worker traces include result serialization, which can
+execute SQLGlot code after the worker function returns. Platform or dependency
+differences can affect coverage. The optional `Dockerfile.coverage` rebuilds
+coverage from the pinned source on Linux.
 
-Selected tests are greedily balanced over the worker count with the lowest
-estimated cost, including the scorer's two-second worker overhead.
+For a replacement inside a function, the selector looks up tests covering the
+changed lines and, for multiline conditions, the start of the expression.
+A per-file inverted index stores the tests for each line as a bitset.
+Insertions use neighboring functions or file coverage. Fixture paths select
+their recorded readers. For likely equivalent Python edits, we apply the
+hunks to the original file and compare the full syntax trees. The comparison
+also recognizes identity/equality substitutions for certain inferred types.
+Those inferences can be wrong for dynamically assigned values. Tests recorded
+reading the file still run.
+
+The scheduler sorts selected tests by duration and tries up to eight worker
+counts. It skips counts whose best possible cost already exceeds or ties the
+best schedule found. Each new test goes to the least-loaded worker.
 
 ## Try it
 
