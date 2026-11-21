@@ -290,46 +290,6 @@ def _changed_source_tests(
         return _fixture_tests(path, coverage_map.get("access", {}), test_ids)
     if path.startswith("tests/"):
         dep_tests = _dependent_tests(path, coverage_map, test_ids, index)
-        test_status = "unknown"
-        if index is not None and not change.get("is_deleted") and not change.get("is_new") and not change.get("is_rename"):
-            sq_root = APP / "sqlglot_src"
-            if sq_root.is_dir():
-                test_status = index.check_test_file(change, sq_root)
-                if test_status == "equivalent":
-                    return set()
-        if (
-            index is not None
-            and test_status != "syntax_error"
-            and not dep_tests
-            and Path(path).name.startswith("test_")
-            and not change.get("is_deleted")
-            and not change.get("is_new")
-            and not change.get("is_rename")
-        ):
-            methods = index.test_methods.get(path, ())
-            old_lines = change["old_lines"]
-            anchors = change["insertion_anchors"]
-            if methods and (old_lines or anchors):
-                # Only narrow if EVERY changed line and insertion anchor falls strictly inside
-                # a known test_* method body (never def headers, setUp, helpers, or module scope).
-                id_set = set(test_ids)
-                matched: set[str] = set()
-                all_inside = True
-                for ln in old_lines:
-                    hits = [tid for s, e, tid in methods if s <= ln <= e and tid in id_set]
-                    if not hits:
-                        all_inside = False
-                        break
-                    matched.update(hits)
-                if all_inside:
-                    for anc in anchors:
-                        hits = [tid for s, e, tid in methods if s <= anc <= e and tid in id_set]
-                        if not hits:
-                            all_inside = False
-                            break
-                        matched.update(hits)
-                if all_inside and matched:
-                    return matched
         selected = _module_tests(path, test_ids)
         selected.update(dep_tests)
         if Path(path).name == "conftest.py" or (not selected and path.endswith(".py")):
@@ -472,15 +432,9 @@ def _changed_source_tests(
                             else:
                                 attr_hits.update(_tests_covering_region(coverage_map["source"], reader, [(n, n) for n in sites]))
                     if all_have_readers and attr_hits:
-                        dp = getattr(index, "dialect_profile", None) or {}
-                        d_users = dp.get("dialect_tests", {}).get(path)
-                        if d_users is not None:
-                            allowed = set(d_users) | set(dp.get("unprofiled", ()))
-                            narrowed = attr_hits & allowed
-                            if narrowed:
-                                return narrowed
-                        selected = set(attr_hits)
-                        selected.update(_module_tests(path, test_ids))
+                        selected.update(attr_hits)
+                        selected.update(base_extra)
+                        selected.update(_dependent_tests(path, coverage_map, test_ids, index))
                         return selected
             selected.update(_file_tests(path, coverage_map))
             selected.update(_dependent_tests(path, coverage_map, test_ids, index))
