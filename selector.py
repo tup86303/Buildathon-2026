@@ -10,6 +10,7 @@ from bisect import bisect_left
 from pathlib import Path, PurePosixPath
 from source_analysis import SourceIndex
 from coverage_index import LineIndex
+from verifier import verify_and_prune
 
 DATA = Path("/data")
 APP = Path("/app")
@@ -251,6 +252,35 @@ def _fixture_tests(path: str, access: dict, test_ids: list[str]) -> set[str]:
     return result
 
 
+def _expr_symbol_tests(path: str, changed_lines: set[int], coverage_map: dict, index) -> set[str] | None:
+    if index is None or not path.startswith("sqlglot/expressions/") or path.endswith("__init__.py") or not changed_lines:
+        return None
+    sym_data = getattr(index, "expr_symbols", None)
+    if not sym_data:
+        return None
+    defs = sym_data.get("classes", {}).get(path, ())
+    if not defs:
+        return None
+    matched = set()
+    for ln in changed_lines:
+        hits = [name for s, e, name in defs if s <= ln <= e]
+        if not hits:
+            return None
+        matched.update(hits)
+    func_classes = set(sym_data.get("func_classes", ()))
+    if matched & func_classes:
+        return set()  # sentinel: metaclass-registered Func subclass -> caller must widen
+    refs_map = sym_data.get("refs", {})
+    if not matched or any(name not in refs_map for name in matched):
+        return None
+    source = coverage_map.get("source", {})
+    selected: set[str] = set()
+    for name in matched:
+        for ref_file, regions in refs_map[name].items():
+            selected.update(_tests_covering_region(source, ref_file, [(s, e) for s, e in regions]))
+    return selected if selected else None
+
+
 def _changed_source_tests(
     change: dict, coverage_map: dict, test_ids: list[str], index=None, analysis: str = "unknown"
 ) -> set[str]:
@@ -260,8 +290,49 @@ def _changed_source_tests(
     if path.startswith("tests/fixtures/"):
         return _fixture_tests(path, coverage_map.get("access", {}), test_ids)
     if path.startswith("tests/"):
+        dep_tests = _dependent_tests(path, coverage_map, test_ids, index)
+        test_status = "unknown"
+        if index is not None and not change.get("is_deleted") and not change.get("is_new") and not change.get("is_rename"):
+            sq_root = APP / "sqlglot_src"
+            if sq_root.is_dir():
+                test_status = index.check_test_file(change, sq_root)
+                if test_status == "equivalent":
+                    return set()
+        if (
+            index is not None
+            and test_status != "syntax_error"
+            and not dep_tests
+            and Path(path).name.startswith("test_")
+            and not change.get("is_deleted")
+            and not change.get("is_new")
+            and not change.get("is_rename")
+        ):
+            methods = index.test_methods.get(path, ())
+            old_lines = change["old_lines"]
+            anchors = change["insertion_anchors"]
+            if methods and (old_lines or anchors):
+                # Only narrow if EVERY changed line and insertion anchor falls strictly inside
+                # a known test_* method body (never def headers, setUp, helpers, or module scope).
+                id_set = set(test_ids)
+                matched: set[str] = set()
+                all_inside = True
+                for ln in old_lines:
+                    hits = [tid for s, e, tid in methods if s <= ln <= e and tid in id_set]
+                    if not hits:
+                        all_inside = False
+                        break
+                    matched.update(hits)
+                if all_inside:
+                    for anc in anchors:
+                        hits = [tid for s, e, tid in methods if s <= anc <= e and tid in id_set]
+                        if not hits:
+                            all_inside = False
+                            break
+                        matched.update(hits)
+                if all_inside and matched:
+                    return matched
         selected = _module_tests(path, test_ids)
-        selected.update(_dependent_tests(path, coverage_map, test_ids, index))
+        selected.update(dep_tests)
         if Path(path).name == "conftest.py" or (not selected and path.endswith(".py")):
             prefix = str(PurePosixPath(path).parent)
             prefix = "" if prefix == "." else prefix + "/"
@@ -277,8 +348,8 @@ def _changed_source_tests(
     base_extra = set(coverage_map.get("dialect_tests", {}).get(dialect_key, []))
     base_extra.update(_module_tests(path, test_ids))
 
-    # Syntax errors in sqlglot/ can break module import across the suite.
-    if analysis == "syntax_error":
+    # Syntax errors or package __init__.py re-export edits in sqlglot/ can break imports across the suite.
+    if analysis == "syntax_error" or Path(path).name == "__init__.py":
         return set(test_ids)
     if (
         analysis == "unknown"
@@ -291,7 +362,13 @@ def _changed_source_tests(
         selected.update(base_extra)
         return selected or set(test_ids)
 
-    changed_lines = change["old_lines"]
+    if index is not None and analysis in {"local_expr", "structural"} and len(change.get("hunks", ())) >= 2:
+        changed_lines, filtered_anchors = index.filter_unchanged_function_lines(change)
+        if not changed_lines and not filtered_anchors:
+            return set()
+        change = {**change, "old_lines": changed_lines, "insertion_anchors": filtered_anchors}
+    else:
+        changed_lines = change["old_lines"]
     lines = set(changed_lines)
     if index is not None:
         starts = index.conditions.get(path, {})
@@ -304,8 +381,18 @@ def _changed_source_tests(
     selected = _tests_covering_region(
         coverage_map.get("source", {}), path, [(line, line) for line in lines]
     )
+    if index is not None and changed_lines:
+        dp = getattr(index, "dialect_profile", None) or {}
+        for d_rel, file_lines in dp.get("lazy_import_lines", {}).items():
+            traced = file_lines.get(path)
+            if traced and (changed_lines & set(traced)):
+                selected.update(dp.get("dialect_tests", {}).get(d_rel, ()))
     functions = coverage_map.get("functions", {}).get(path, ())
-    in_body = bool(changed_lines) and all(
+    header_ranges = index.def_headers.get(path, ()) if index is not None else ()
+    in_def_header = any(
+        any(s <= line <= e for s, e in header_ranges) for line in changed_lines
+    )
+    in_body = bool(changed_lines) and not in_def_header and all(
         any(f["start"] < line <= f["end"] for f in functions) for line in changed_lines
     )
 
@@ -320,6 +407,8 @@ def _changed_source_tests(
                 selected.update(base_extra)
         return selected or set(test_ids)
 
+    if in_def_header and changed_lines:
+        selected.update(_function_tests(path, changed_lines, coverage_map, innermost_only=True))
     if (not selected or analysis == "structural") and changed_lines:
         selected.update(_function_tests(path, changed_lines, coverage_map, innermost_only=bool(selected)))
 
@@ -330,13 +419,92 @@ def _changed_source_tests(
             not any(f["start"] < line <= f["end"] for f in functions) for line in changed_lines
         )
         if has_module_or_class_line:
+            expr_hits = _expr_symbol_tests(path, changed_lines, coverage_map, index)
+            if expr_hits is not None and not expr_hits:
+                # Metaclass-registered Func subclass (Parser.FUNCTIONS dynamic dispatch): widen safely!
+                return set(test_ids)
+            if expr_hits is not None and not change["insertion_anchors"]:
+                selected = set(expr_hits)
+                selected.update(base_extra)
+                return selected
+            if (
+                index is not None
+                and path.startswith("sqlglot/dialects/")
+                and not path.endswith(("__init__.py", "/dialect.py"))
+                and not change["insertion_anchors"]
+            ):
+                bindings = index.scalar_bindings.get(path, {})
+                bound_names = [bindings.get(str(line)) for line in changed_lines]
+                if bound_names and all(n is not None for n in bound_names):
+                    # Replacing a literal assignment with executable code can
+                    # cause import errors before any tracked attribute read.
+                    replacement_names = []
+                    for line in change["added"]:
+                        try:
+                            statements = ast.parse(line.strip()).body
+                        except SyntaxError:
+                            return set(test_ids)
+                        if len(statements) != 1:
+                            return set(test_ids)
+                        assignment = statements[0]
+                        if (not isinstance(assignment, ast.Assign)
+                                or len(assignment.targets) != 1
+                                or not isinstance(assignment.targets[0], ast.Name)
+                                or not isinstance(assignment.value, ast.Constant)):
+                            return set(test_ids)
+                        replacement_names.append(assignment.targets[0].id)
+                    if sorted(replacement_names) != sorted(bound_names):
+                        return set(test_ids)
+                    attr_hits: set[str] = set()
+                    all_have_readers = True
+                    for name in set(bound_names):
+                        readers = index.read_sites.get(name, {})
+                        if not readers:
+                            all_have_readers = False
+                            break
+                        for reader, sites in readers.items():
+                            if reader.startswith("tests/"):
+                                attr_hits.update(_module_tests(reader, test_ids))
+                            else:
+                                attr_hits.update(_tests_covering_region(coverage_map["source"], reader, [(n, n) for n in sites]))
+                    if all_have_readers and attr_hits:
+                        dp = getattr(index, "dialect_profile", None) or {}
+                        d_users = dp.get("dialect_tests", {}).get(path)
+                        if d_users is not None:
+                            allowed = set(d_users) | set(dp.get("unprofiled", ()))
+                            narrowed = attr_hits & allowed
+                            if narrowed:
+                                return narrowed
+                        selected = set(attr_hits)
+                        selected.update(_module_tests(path, test_ids))
+                        return selected
             selected.update(_file_tests(path, coverage_map))
             selected.update(_dependent_tests(path, coverage_map, test_ids, index))
+            # Non-scalar class/module edits in dialect/parser/generator files (e.g. KEYWORDS, FUNCTIONS,
+            # TRANSFORMS, TYPE_MAPPING) can affect cross-dialect tests that never execute runtime lines
+            # in the edited file; include all MRO-matched runtime dialect users from dialect-profile.
+            if index is not None and path.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")):
+                dp = getattr(index, "dialect_profile", None) or {}
+                d_rel = f"sqlglot/dialects/{Path(path).name}"
+                d_users = dp.get("dialect_tests", {}).get(d_rel)
+                if d_users:
+                    # test_generator_memory only instantiates dialect.generator() in a loop (no tokenizer/parser)
+                    is_gen_file = path.startswith("sqlglot/generators/")
+                    if not is_gen_file:
+                        selected.update(t for t in d_users if not t.endswith("::test_generator_memory"))
+                    else:
+                        selected.update(d_users)
+                    selected.update(dp.get("unprofiled", ()))
+                if path.startswith("sqlglot/typing/"):
+                    selected.update(t for t in test_ids if t.endswith(("::test_annotate_types", "::test_annotate_funcs")))
             if index is not None:
                 bindings = index.scalar_bindings.get(path, {})
                 for name in {bindings.get(str(line)) for line in changed_lines} - {None}:
                     for reader, sites in index.read_sites.get(name, {}).items():
-                        selected.update(_tests_covering_region(coverage_map["source"], reader, [(n, n) for n in sites]))
+                        if reader.startswith("tests/"):
+                            selected.update(_module_tests(reader, test_ids))
+                        else:
+                            selected.update(_tests_covering_region(coverage_map["source"], reader, [(n, n) for n in sites]))
 
     for anchor in change["insertion_anchors"]:
         # No baseline test could execute the added lines. Use the enclosing
@@ -344,9 +512,21 @@ def _changed_source_tests(
         neighbors = {max(1, anchor - 1), anchor}
         affected = _function_tests(path, neighbors, coverage_map)
         if not affected:
-            # Module-scope insertions can affect any consumer of this file.
+            # Module/class-scope insertions can affect any consumer of this file (and cross-dialect users).
             affected = _file_tests(path, coverage_map)
             affected.update(_dependent_tests(path, coverage_map, test_ids, index))
+            if index is not None and path.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")):
+                dp = getattr(index, "dialect_profile", None) or {}
+                d_rel = f"sqlglot/dialects/{Path(path).name}"
+                d_users = dp.get("dialect_tests", {}).get(d_rel)
+                if d_users:
+                    if not path.startswith("sqlglot/generators/"):
+                        affected.update(t for t in d_users if not t.endswith("::test_generator_memory"))
+                    else:
+                        affected.update(d_users)
+                    affected.update(dp.get("unprofiled", ()))
+                if path.startswith("sqlglot/typing/"):
+                    affected.update(t for t in test_ids if t.endswith(("::test_annotate_types", "::test_annotate_funcs")))
         selected.update(affected)
 
     selected.update(base_extra)
@@ -465,16 +645,31 @@ def _split(tests: list[dict]) -> list[list[int]]:
     return best_workers
 
 
+def _schedule_cost_ms(workers: list[list[int]], dur_map: dict[int, int]) -> int:
+    if not workers:
+        return 0
+    return max(sum(dur_map[n] for n in w) for w in workers) + 2_000 * len(workers)
+
+
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ids = [test["id"] for test in tests]
+    dur_map = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
     coverage_map = json.loads((APP / "coverage-map.json").read_text())
     if "line_index" in coverage_map:
         coverage_map["source"] = coverage_map.pop("line_index")
     index = SourceIndex(APP / "source-index.zip")
+    sqlglot_root = APP / "sqlglot_src"
     for patch in sorted((DATA / "commits").glob("*.patch")):
+        changes = _patch_changes(patch)
         selected = _select_tests(patch, coverage_map, tests, ids, index)
-        print(json.dumps({"commit": patch.stem, "workers": _split(selected)}))
+        workers = _split(selected)
+        if selected and sqlglot_root.exists():
+            est_ms = _schedule_cost_ms(workers, dur_map)
+            pruned = verify_and_prune(sqlglot_root, changes, index, selected, est_ms)
+            if len(pruned) != len(selected):
+                workers = _split(pruned)
+        print(json.dumps({"commit": patch.stem, "workers": workers}))
     print("selected tests using pinned-source coverage", file=sys.stderr)
 
 

@@ -125,6 +125,115 @@ def _python_child_imports(tree, path, modules):
                 yield test, _resolve_imports(path, child, modules)
 
 
+
+
+_EXPR_BASE_EXCLUDED = {
+    "Expression", "Condition", "Predicate", "Binary", "Unary", "Func", "AggFunc",
+    "DataType", "DDL", "DML", "Query", "DerivedTable", "Unionable", "Subqueryable", "Property",
+}
+
+
+def _build_expr_symbols(root: Path) -> dict:
+    """Map concrete sqlglot/expressions/*.py ClassDef spans to body-only runtime reference regions."""
+    expr_classes: dict[str, list[list]] = defaultdict(list)
+    class_children: dict[str, set[str]] = defaultdict(set)
+    all_expr_names: set[str] = set()
+    expr_dir = root / "sqlglot" / "expressions"
+    if not expr_dir.exists():
+        return {"classes": {}, "refs": {}}
+
+    for f in sorted(expr_dir.rglob("*.py")):
+        rel = f.relative_to(root).as_posix()
+        if rel.endswith("__init__.py"):
+            continue
+        try:
+            tree = ast.parse(f.read_bytes())
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                all_expr_names.add(node.name)
+                start = min([node.lineno, *(d.lineno for d in node.decorator_list)])
+                end = node.end_lineno or node.lineno
+                expr_classes[rel].append([start, end, node.name])
+                for b in node.bases:
+                    bname = b.id if isinstance(b, ast.Name) else (b.attr if isinstance(b, ast.Attribute) else None)
+                    if bname:
+                        class_children[bname].add(node.name)
+
+    raw_refs: dict[str, dict[str, list[list[int]]]] = defaultdict(lambda: defaultdict(list))
+    for f in sorted((root / "sqlglot").rglob("*.py")):
+        rel = f.relative_to(root).as_posix()
+        if rel.startswith("sqlglot/expressions/"):
+            continue
+        try:
+            tree = ast.parse(f.read_bytes())
+        except SyntaxError:
+            continue
+        for fn in (n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))):
+            if not fn.body:
+                continue
+            body_start = fn.body[0].lineno
+            body_end = fn.end_lineno or body_start
+            ann_syms = set()
+            for arg in fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs:
+                if arg.annotation:
+                    for n in ast.walk(arg.annotation):
+                        s = n.id if isinstance(n, ast.Name) else (n.attr if isinstance(n, ast.Attribute) else None)
+                        if s in all_expr_names:
+                            ann_syms.add(s)
+            for s in ann_syms:
+                raw_refs[s][rel].append([body_start, body_end])
+            for stmt in fn.body:
+                for n in ast.walk(stmt):
+                    s = n.id if isinstance(n, ast.Name) else (n.attr if isinstance(n, ast.Attribute) else None)
+                    if s in all_expr_names:
+                        ln = getattr(n, "lineno", None)
+                        if ln is not None and body_start <= ln <= body_end:
+                            raw_refs[s][rel].append([ln, ln])
+
+    # Pre-expand subclass closures and merge intervals per concrete class
+    merged_refs: dict[str, dict[str, list[list[int]]]] = {}
+    for sym in sorted(all_expr_names - _EXPR_BASE_EXCLUDED):
+        closure = {sym}
+        q = deque([sym])
+        while q:
+            c = q.popleft()
+            for ch in class_children.get(c, ()):
+                if ch not in closure:
+                    closure.add(ch)
+                    q.append(ch)
+        per_file: dict[str, list[list[int]]] = defaultdict(list)
+        for c in closure:
+            for rf, regs in raw_refs.get(c, {}).items():
+                per_file[rf].extend(regs)
+        if per_file:
+            compact = {}
+            for rf, regs in per_file.items():
+                merged: list[list[int]] = []
+                for s, e in sorted(regs):
+                    if merged and s <= merged[-1][1] + 1:
+                        merged[-1][1] = max(merged[-1][1], e)
+                    else:
+                        merged.append([s, e])
+                compact[rf] = merged
+            merged_refs[sym] = compact
+
+    # Identify all Func subclasses (dynamically registered into Parser.FUNCTIONS by _Func metaclass)
+    # so selector.py widens safely instead of under-selecting via static symbol refs.
+    func_classes: set[str] = {"Func"}
+    changed = True
+    while changed:
+        changed = False
+        for parent, kids in list(class_children.items()):
+            if parent in func_classes:
+                for kid in kids:
+                    if kid not in func_classes:
+                        func_classes.add(kid)
+                        changed = True
+    return {"classes": dict(expr_classes), "refs": merged_refs, "func_classes": sorted(func_classes)}
+
+
 def build(root, destination):
     names = Counter()
     plain = set()
@@ -153,6 +262,8 @@ def build(root, destination):
     scalar_bindings = defaultdict(dict)
     read_sites = defaultdict(lambda: defaultdict(set))
     doctest_suites = set()
+    def_headers = defaultdict(list)
+    test_methods = defaultdict(list)
 
     with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:
         for file in all_files:
@@ -167,11 +278,21 @@ def build(root, destination):
             if rel.startswith("sqlglot/"):
                 source_imports[rel] = deps
                 for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.body:
+                        first_body = node.body[0].lineno
+                        if first_body > node.lineno + 1:
+                            def_headers[rel].append([node.lineno, first_body - 1])
                     if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
                         read_sites[node.attr][rel].add(node.lineno)
                     elif isinstance(node, ast.ClassDef):
                         for stmt in node.body:
-                            if not isinstance(stmt, (ast.Assign, ast.AnnAssign)) or not isinstance(stmt.value, ast.Constant):
+                            _val = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
+                            _is_scalar = isinstance(_val, ast.Constant) or (
+                                isinstance(_val, ast.UnaryOp)
+                                and isinstance(_val.op, (ast.UAdd, ast.USub))
+                                and isinstance(_val.operand, ast.Constant)
+                            )
+                            if not _is_scalar:
                                 continue
                             targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
                             for target in targets:
@@ -179,6 +300,14 @@ def build(root, destination):
                                     for line in range(stmt.lineno, stmt.end_lineno + 1):
                                         scalar_bindings[rel][line] = target.id
             elif Path(rel).name.startswith("test_"):
+                for node in tree.body:
+                    if isinstance(node, ast.ClassDef):
+                        for item in node.body:
+                            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test_") and item.body:
+                                test_methods[rel].append([item.body[0].lineno, item.end_lineno or item.lineno, f"{rel}::{node.name}::{item.name}"])
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+                        read_sites[node.attr][rel].add(node.lineno)
                 child_imports.extend(_python_child_imports(tree, rel, known_modules))
                 if any(isinstance(n, ast.Attribute) and n.attr == "DocTestSuite" for n in ast.walk(tree)):
                     doctest_suites.add(rel)
@@ -324,10 +453,18 @@ def build(root, destination):
             name: {p: sorted(lines) for p, lines in read_sites[name].items()} for name in sorted(fields)
         }]))
         archive.writestr("doctest-suites.json", json.dumps(sorted(doctest_suites)))
+        archive.writestr("def-headers.json", json.dumps({k: sorted(v) for k, v in def_headers.items()}))
+        archive.writestr("test-methods.json", json.dumps({k: sorted(v) for k, v in test_methods.items()}))
         archive.writestr("identity-classes.json", json.dumps(safe))
         archive.writestr("condition-starts.json", json.dumps(conditions))
         archive.writestr("module-dependents.json", json.dumps(module_dependents))
         archive.writestr("enum-fields.json", json.dumps(enum_fields))
+        archive.writestr("expr-symbols.json", json.dumps(_build_expr_symbols(root)))
+        for dp_cand in (Path(destination).parent / "dialect-profile.json.gz", Path(__file__).parent / "dialect-profile.json.gz"):
+            if dp_cand.exists():
+                import gzip as _gzip
+                archive.writestr("dialect-profile.json", _gzip.decompress(dp_cand.read_bytes()))
+                break
         archive.writestr("baseline-hashes.json", json.dumps({
             "cf": cf_hashes,
             "sig_eq": sig_hashes_eq,
