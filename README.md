@@ -27,6 +27,12 @@ Lower is better. [SCORING.md](SCORING.md) has the exact rules; in short:
 
 ## Selection strategy
 
+The default image unpacks a checked-in coverage map from the pinned SQLGlot
+revision. It was collected on Windows with executor integration enabled and
+includes a second pass through the process-pool tests with child coverage.
+`Dockerfile.coverage` contains the Linux recipe for collecting a fresh map.
+Platform and dependency differences can change which lines a test reaches.
+
 During the image build, the Dockerfile checks out sqlglot at the pinned base
 revision and runs its tests with per-test coverage contexts. It saves the
 source lines measured during test setup, execution and teardown, plus non-Python

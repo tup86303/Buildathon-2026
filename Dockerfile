@@ -1,33 +1,6 @@
-# Fetch only the public sqlglot repository at the pinned base revision.
-FROM alpine/git:v2.47.2@sha256:0d9a3a551058dba37ea77757955d3e834442ccf8540783671cc25c0d97957894 AS source
-RUN git clone https://github.com/tobymao/sqlglot.git /sqlglot \
-    && git -C /sqlglot checkout --detach eb11aec4be8cb2122afe713a4816662c3f0fb2fa
-
-# Build per-test coverage against the exact source revision used by the scorer.
-FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS coverage
-
-COPY requirements.lock /tmp/requirements.lock
-RUN python -m pip install --no-cache-dir -r /tmp/requirements.lock
-
-COPY --from=source /sqlglot /sqlglot
-
-COPY build_coverage.py build_coverage_plugin.py pool_coverage.py /app/
-ENV PYTHONPATH=/app:/sqlglot
-ENV SQLGLOT_ROOT=/sqlglot
-ENV COVERAGE_FILE=/tmp/.coverage
-ENV COVERAGE_ACCESS_FILE=/tmp/coverage-access.tsv
-ENV OPENBLAS_NUM_THREADS=1
-ENV OMP_NUM_THREADS=1
-ENV MKL_NUM_THREADS=1
-ENV PYTHON_CPU_COUNT=2
-
-RUN cd /sqlglot \
-    && SKIP_INTEGRATION=0 pytest -q -n 4 --cov=sqlglot --cov-context=test \
-       --cov-report= -p build_coverage_plugin tests \
-    && python /app/build_coverage.py /tmp/.coverage /tmp/coverage-access.tsv \
-       /sqlglot /app/coverage-map.json
-
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
-COPY selector.py /app/selector.py
-COPY --from=coverage /app/coverage-map.json /app/coverage-map.json
+WORKDIR /app
+COPY coverage-map.json.gz /app/
+RUN python -c "import gzip, shutil; src = gzip.open('coverage-map.json.gz', 'rb'); dst = open('coverage-map.json', 'wb'); shutil.copyfileobj(src, dst); dst.close(); src.close()"
+COPY selector.py /app/
 CMD ["python", "/app/selector.py"]
