@@ -449,8 +449,13 @@ def _changed_source_tests(
                         assignment = statements[0]
                         if (not isinstance(assignment, ast.Assign)
                                 or len(assignment.targets) != 1
-                                or not isinstance(assignment.targets[0], ast.Name)
-                                or not isinstance(assignment.value, ast.Constant)):
+                                or not isinstance(assignment.targets[0], ast.Name)):
+                            return set(test_ids)
+                        try:
+                            literal = ast.literal_eval(assignment.value)
+                        except (SyntaxError, ValueError):
+                            return set(test_ids)
+                        if not isinstance(literal, (str, bytes, bool, int, float, complex, type(None))):
                             return set(test_ids)
                         replacement_names.append(assignment.targets[0].id)
                     if sorted(replacement_names) != sorted(bound_names):
