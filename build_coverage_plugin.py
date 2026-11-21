@@ -5,6 +5,7 @@ from __future__ import annotations
 import builtins
 import io
 import os
+import tokenize
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -57,6 +58,7 @@ def _tracked_io_open(file: object, *args: object, **kwargs: object):
 
 builtins.open = _tracked_open
 io.open = _tracked_io_open
+tokenize._builtin_open = _tracked_open
 ProcessPoolExecutor.submit = _tracked_submit
 ProcessPoolExecutor.__init__ = _bounded_pool
 

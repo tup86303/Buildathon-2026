@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import sys
@@ -13,6 +14,22 @@ from coverage_index import LineIndex
 DATA = Path("/data")
 APP = Path("/app")
 HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+DIFF_GIT = re.compile(r'^diff --git ("(?:\\.|[^"\\])*"|a/.+?) ("(?:\\.|[^"\\])*"|b/.+)$')
+BRANCH_HEADER_RE = re.compile(r"^\s*(?:elif\b|else\s*:|except\b|finally\s*:|case\b)")
+
+
+def _unquote_git_path(raw: str, prefixed: bool = True) -> str:
+    raw = raw.partition("\t")[0]
+    if raw.startswith('"') and raw.endswith('"'):
+        try:
+            raw = ast.literal_eval("b" + raw).decode("utf-8", "surrogateescape")
+        except (SyntaxError, ValueError):
+            raw = raw[1:-1]
+    if raw == "/dev/null":
+        return ""
+    if prefixed and raw.startswith(("a/", "b/")):
+        return raw[2:]
+    return raw
 
 
 def _patch_changes(patch: Path) -> list[dict]:
@@ -23,12 +40,20 @@ def _patch_changes(patch: Path) -> list[dict]:
     replacing = False
     for line in patch.read_text(encoding="utf-8", errors="replace").splitlines():
         if line.startswith("diff --git "):
-            parts = line.split()
-            old_path = parts[2][2:] if len(parts) > 2 and parts[2].startswith("a/") else ""
-            new_path = parts[3][2:] if len(parts) > 3 and parts[3].startswith("b/") else ""
+            m = DIFF_GIT.match(line)
+            if m:
+                old_path = _unquote_git_path(m.group(1))
+                new_path = _unquote_git_path(m.group(2))
+            else:
+                parts = line.split()
+                old_path = _unquote_git_path(parts[2]) if len(parts) > 2 else ""
+                new_path = _unquote_git_path(parts[3]) if len(parts) > 3 else ""
             current = {
-                "old": "" if old_path == "/dev/null" else old_path,
-                "new": "" if new_path == "/dev/null" else new_path,
+                "old": old_path,
+                "new": new_path,
+                "is_deleted": False,
+                "is_new": False,
+                "is_rename": False,
                 "old_lines": set(),
                 "insertion_anchors": set(),
                 "added": [],
@@ -40,6 +65,37 @@ def _patch_changes(patch: Path) -> list[dict]:
             continue
         if current is None:
             continue
+        if not in_hunk:
+            if line.startswith("deleted file mode "):
+                current["is_deleted"] = True
+                continue
+            if line.startswith("new file mode "):
+                current["is_new"] = True
+                continue
+            if line.startswith("rename from "):
+                current["is_rename"] = True
+                current["old"] = _unquote_git_path(line[len("rename from "):], prefixed=False)
+                continue
+            if line.startswith("rename to "):
+                current["is_rename"] = True
+                current["new"] = _unquote_git_path(line[len("rename to "):], prefixed=False)
+                continue
+            if line.startswith("--- "):
+                old_p = _unquote_git_path(line[4:])
+                if old_p == "":
+                    current["old"] = ""
+                    current["is_new"] = True
+                else:
+                    current["old"] = old_p
+                continue
+            if line.startswith("+++ "):
+                new_p = _unquote_git_path(line[4:])
+                if new_p == "":
+                    current["new"] = ""
+                    current["is_deleted"] = True
+                else:
+                    current["new"] = new_p
+                continue
         match = HUNK.match(line)
         if match:
             current["hunks"].append((int(match[1]), int(match[2] or 1), int(match[4] or 1), []))
@@ -68,11 +124,19 @@ def _patch_changes(patch: Path) -> list[dict]:
 
 
 def _normalized(path: str) -> str:
-    return str(PurePosixPath(path))
+    return str(PurePosixPath(path)) if path else ""
+
+
+def _get_source_entry(source: dict, path: str):
+    entry = source.get(path)
+    if isinstance(entry, list):
+        entry = LineIndex(entry)
+        source[path] = entry
+    return entry
 
 
 def _tests_covering_region(source: dict, path: str, regions: list[tuple[int, int]]) -> set[str]:
-    index = source.get(path)
+    index = _get_source_entry(source, path)
     if isinstance(index, LineIndex):
         return index.covering(regions)
     merged: list[list[int]] = []
@@ -85,26 +149,68 @@ def _tests_covering_region(source: dict, path: str, regions: list[tuple[int, int
     result: set[str] = set()
     for test_id, lines in source.get(path, {}).items():
         for start, end in merged:
-            index = bisect_left(lines, start)
-            if index < len(lines) and lines[index] <= end:
+            idx = bisect_left(lines, start)
+            if idx < len(lines) and lines[idx] <= end:
                 result.add(test_id)
                 break
     return result
 
 
-def _function_tests(path: str, changed_lines: set[int], coverage_map: dict) -> set[str]:
-    functions = coverage_map.get("functions", {})
+def _file_tests(path: str, coverage_map: dict) -> set[str]:
+    entry = _get_source_entry(coverage_map.get("source", {}), path)
+    if entry is None:
+        return set()
+    return set(entry)
+
+
+def _dependent_tests(path: str, coverage_map: dict, test_ids: list[str], index=None) -> set[str]:
+    if index is None:
+        return set()
+    deps = index.module_dependents.get(path)
+    if not deps:
+        return set()
+    result: set[str] = set()
+    for dep_src in deps.get("sqlglot", ()):
+        result.update(_file_tests(dep_src, coverage_map))
+        dialect_key = re.sub(r"[^a-z0-9]", "", Path(dep_src).stem.lower())
+        result.update(coverage_map.get("dialect_tests", {}).get(dialect_key, []))
+        result.update(_module_tests(dep_src, test_ids))
+    dep_test_files = set(deps.get("tests", ()))
+    if dep_test_files:
+        for test_id in test_ids:
+            test_file = test_id.partition("::")[0]
+            if test_file in dep_test_files:
+                result.add(test_id)
+    return result
+
+
+def _function_tests(path: str, changed_lines: set[int], coverage_map: dict, innermost_only: bool = False) -> set[str]:
+    functions = coverage_map.get("functions", {}).get(path, [])
     matching = [
         function
-        for function in functions.get(path, [])
+        for function in functions
         if any(function["start"] <= line <= function["end"] for line in changed_lines)
     ]
     if not matching:
         return set()
 
-    source = coverage_map.get("source", {})
+    if innermost_only:
+        chosen = []
+        for line in changed_lines:
+            enclosing = [f for f in matching if f["start"] <= line <= f["end"]]
+            if enclosing:
+                chosen.append(min(enclosing, key=lambda f: f["end"] - f["start"]))
+        if chosen:
+            result = _tests_covering_region(
+                coverage_map.get("source", {}),
+                path,
+                [(f["start"], f["end"]) for f in chosen],
+            )
+            if result:
+                return result
+
     return _tests_covering_region(
-        source,
+        coverage_map.get("source", {}),
         path,
         [(function["start"], function["end"]) for function in matching],
     )
@@ -140,34 +246,98 @@ def _fixture_tests(path: str, access: dict, test_ids: list[str]) -> set[str]:
             if test_id.startswith(f"tests/{category}/")
             or test_id.startswith(f"tests/test_{category}.py::")
         )
+    if not result:
+        return set(test_ids)
     return result
 
 
-def _changed_source_tests(change: dict, coverage_map: dict, test_ids: list[str], index=None) -> set[str]:
+def _changed_source_tests(
+    change: dict, coverage_map: dict, test_ids: list[str], index=None, analysis: str = "unknown"
+) -> set[str]:
     path = _normalized(change["old"] or change["new"])
+    if not path:
+        return set(test_ids)
     if path.startswith("tests/fixtures/"):
         return _fixture_tests(path, coverage_map.get("access", {}), test_ids)
     if path.startswith("tests/"):
-        return _module_tests(path, test_ids)
+        selected = _module_tests(path, test_ids)
+        selected.update(_dependent_tests(path, coverage_map, test_ids, index))
+        if Path(path).name == "conftest.py" or (not selected and path.endswith(".py")):
+            prefix = str(PurePosixPath(path).parent)
+            prefix = "" if prefix == "." else prefix + "/"
+            selected.update(t for t in test_ids if t.startswith(prefix))
+        return selected
     if not path.startswith("sqlglot/") or not path.endswith(".py"):
-        return _fixture_tests(path, coverage_map.get("access", {}), test_ids)
+        result = _fixture_tests(path, coverage_map.get("access", {}), test_ids)
+        if Path(path).name in {"pyproject.toml", "setup.py", "setup.cfg", "pytest.ini"} or (path.endswith(".py") and not result):
+            return set(test_ids)
+        return result
+
+    dialect_key = re.sub(r"[^a-z0-9]", "", Path(path).stem.lower())
+    base_extra = set(coverage_map.get("dialect_tests", {}).get(dialect_key, []))
+    base_extra.update(_module_tests(path, test_ids))
+
+    # Syntax errors in sqlglot/ can break module import across the suite.
+    if analysis == "syntax_error":
+        return set(test_ids)
+    if (
+        analysis == "unknown"
+        or change.get("is_deleted")
+        or change.get("is_rename")
+        or change.get("is_new")
+    ):
+        selected = _file_tests(path, coverage_map)
+        selected.update(_dependent_tests(path, coverage_map, test_ids, index))
+        selected.update(base_extra)
+        return selected or set(test_ids)
 
     changed_lines = change["old_lines"]
     lines = set(changed_lines)
     if index is not None:
         starts = index.conditions.get(path, {})
-        lines.update(starts.get(str(line), line) for line in changed_lines)
+        for line in changed_lines:
+            extra = starts.get(str(line))
+            if isinstance(extra, list):
+                lines.update(extra)
+            elif isinstance(extra, int):
+                lines.add(extra)
     selected = _tests_covering_region(
         coverage_map.get("source", {}), path, [(line, line) for line in lines]
     )
     functions = coverage_map.get("functions", {}).get(path, ())
-    in_body = changed_lines and all(
+    in_body = bool(changed_lines) and all(
         any(f["start"] < line <= f["end"] for f in functions) for line in changed_lines
     )
+
     if in_body and not change["insertion_anchors"] and change["added"] and change["removed"]:
-        return selected
-    if not selected:
-        selected.update(_function_tests(path, changed_lines, coverage_map))
+        edits = change["added"] + change["removed"]
+        branch_header_edit = any(BRANCH_HEADER_RE.match(s) for s in edits)
+        if not selected or analysis == "structural" or branch_header_edit:
+            selected.update(_function_tests(path, changed_lines, coverage_map, innermost_only=True))
+            if not selected:
+                selected.update(_file_tests(path, coverage_map))
+                selected.update(_dependent_tests(path, coverage_map, test_ids, index))
+                selected.update(base_extra)
+        return selected or set(test_ids)
+
+    if (not selected or analysis == "structural") and changed_lines:
+        selected.update(_function_tests(path, changed_lines, coverage_map, innermost_only=bool(selected)))
+
+    # Module-scope or class-scope replacement (e.g. TRANSFORMS, KEYWORDS, FUNCTIONS, arg_types):
+    # these execute at import time and have 0 runtime line coverage.
+    if changed_lines and not in_body:
+        has_module_or_class_line = any(
+            not any(f["start"] < line <= f["end"] for f in functions) for line in changed_lines
+        )
+        if has_module_or_class_line:
+            selected.update(_file_tests(path, coverage_map))
+            selected.update(_dependent_tests(path, coverage_map, test_ids, index))
+            if index is not None:
+                bindings = index.scalar_bindings.get(path, {})
+                for name in {bindings.get(str(line)) for line in changed_lines} - {None}:
+                    for reader, sites in index.read_sites.get(name, {}).items():
+                        selected.update(_tests_covering_region(coverage_map["source"], reader, [(n, n) for n in sites]))
+
     for anchor in change["insertion_anchors"]:
         # No baseline test could execute the added lines. Use the enclosing
         # function on either side of the gap, including at a function boundary.
@@ -175,12 +345,15 @@ def _changed_source_tests(change: dict, coverage_map: dict, test_ids: list[str],
         affected = _function_tests(path, neighbors, coverage_map)
         if not affected:
             # Module-scope insertions can affect any consumer of this file.
-            affected = set(coverage_map.get("source", {}).get(path, {}))
+            affected = _file_tests(path, coverage_map)
+            affected.update(_dependent_tests(path, coverage_map, test_ids, index))
         selected.update(affected)
-    dialect_key = re.sub(r"[^a-z0-9]", "", Path(path).stem.lower())
-    selected.update(coverage_map.get("dialect_tests", {}).get(dialect_key, []))
-    selected.update(_module_tests(path, test_ids))
-    return selected
+
+    selected.update(base_extra)
+    if not selected:
+        selected.update(_file_tests(path, coverage_map))
+        selected.update(_dependent_tests(path, coverage_map, test_ids, index))
+    return selected or set(test_ids)
 
 
 def _select_tests(
@@ -188,12 +361,71 @@ def _select_tests(
 ) -> list[dict]:
     selected: set[str] = set()
     changes = _patch_changes(patch)
+    if not changes:
+        return tests
     for change in changes:
-        path = _normalized(change["old"] or change["new"])
-        selected.update(coverage_map.get("access", {}).get(path, ()))
-        if index is None or not index.equivalent(change):
-            selected.update(_changed_source_tests(change, coverage_map, ids, index))
+        old_path = _normalized(change["old"])
+        new_path = _normalized(change["new"])
+        for p in {old_path, new_path} - {""}:
+            selected.update(coverage_map.get("access", {}).get(p, ()))
+        if old_path.startswith("sqlglot/") and index and any(
+            marker in s for s in change["added"] + change["removed"] for marker in ('"""', "'''", ">>>")
+        ):
+            for suite in index.doctest_suites:
+                selected.update(_module_tests(suite, ids))
+        analysis = index.analyze(change) if index is not None else "unknown"
+        if analysis != "equivalent":
+            selected.update(_changed_source_tests(change, coverage_map, ids, index, analysis))
+            if new_path and new_path != old_path and old_path:
+                selected.update(_changed_source_tests({**change, "old": new_path}, coverage_map, ids, index))
+            if index is not None:
+                for path in {old_path, new_path}:
+                    selected.update(index.subprocess_readers.get(path, ()))
     return [test for test in tests if test["id"] in selected]
+
+
+def _refine_schedule(workers: list[list[int]], loads: list[int], dur_map: dict[int, int], lower_bound: int) -> None:
+    """Bounded local search: move or swap a test off the busiest worker if it strictly reduces makespan."""
+    k = len(workers)
+    if k <= 1:
+        return
+    for _ in range(30):
+        max_w = max(range(k), key=loads.__getitem__)
+        max_load = loads[max_w]
+        if max_load <= lower_bound:
+            break
+        improved = False
+        min_w = min(range(k), key=loads.__getitem__)
+        for idx, t in enumerate(workers[max_w]):
+            d = dur_map[t]
+            if loads[min_w] + d < max_load:
+                workers[max_w].pop(idx)
+                workers[min_w].append(t)
+                loads[max_w] -= d
+                loads[min_w] += d
+                improved = True
+                break
+        if improved:
+            continue
+        for other_w in range(k):
+            if other_w == max_w:
+                continue
+            for i, t1 in enumerate(workers[max_w]):
+                d1 = dur_map[t1]
+                for j, t2 in enumerate(workers[other_w]):
+                    d2 = dur_map[t2]
+                    if d1 > d2 and max(loads[max_w] - d1 + d2, loads[other_w] - d2 + d1) < max_load:
+                        workers[max_w][i], workers[other_w][j] = t2, t1
+                        loads[max_w] += d2 - d1
+                        loads[other_w] += d1 - d2
+                        improved = True
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+        if not improved:
+            break
 
 
 def _split(tests: list[dict]) -> list[list[int]]:
@@ -204,16 +436,17 @@ def _split(tests: list[dict]) -> list[list[int]]:
         ((test["number"], int(test["seconds"] * 1000 + 0.5)) for test in tests),
         key=lambda item: (-item[1], item[0]),
     )
+    dur_map = dict(ordered)
     total_duration = sum(duration for _, duration in ordered)
     longest = ordered[0][1]
     best_workers: list[list[int]] = []
     best_cost: int | None = None
     for worker_count in range(1, min(8, len(tests)) + 1):
         worker_cost = 2_000 * worker_count
+        average = (total_duration + worker_count - 1) // worker_count
         if best_cost is not None:
             if longest + worker_cost >= best_cost:
                 break
-            average = (total_duration + worker_count - 1) // worker_count
             if average + worker_cost >= best_cost:
                 continue
 
@@ -223,6 +456,8 @@ def _split(tests: list[dict]) -> list[list[int]]:
             worker = loads.index(min(loads))
             workers[worker].append(number)
             loads[worker] += duration
+        if max(loads) > max(longest, average):
+            _refine_schedule(workers, loads, dur_map, max(longest, average))
         cost = max(loads) + worker_cost
         if best_cost is None or cost < best_cost:
             best_cost = cost
@@ -235,7 +470,7 @@ def main() -> None:
     ids = [test["id"] for test in tests]
     coverage_map = json.loads((APP / "coverage-map.json").read_text())
     if "line_index" in coverage_map:
-        coverage_map["source"] = {p: LineIndex(v) for p, v in coverage_map.pop("line_index").items()}
+        coverage_map["source"] = coverage_map.pop("line_index")
     index = SourceIndex(APP / "source-index.zip")
     for patch in sorted((DATA / "commits").glob("*.patch")):
         selected = _select_tests(patch, coverage_map, tests, ids, index)

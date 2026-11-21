@@ -32,7 +32,8 @@ Python sources and type information, and unpacks the team's measured coverage
 map. Build-time inputs include the organizer's starter kit and SQLGlot (MIT).
 The source archive contains the upstream license.
 
-We collected the map on Windows with SQLGlot's executor integration enabled.
+We collected the map on linux/amd64 with Python 3.13, the locked dependencies,
+and SQLGlot's executor integration enabled.
 It combines per-test line coverage, recorded file reads, and separate traces
 for worker processes. Worker traces include result serialization, which can
 execute SQLGlot code after the worker function returns. Platform or dependency
@@ -43,15 +44,24 @@ For a replacement inside a function, the selector looks up tests covering the
 changed lines and, for multiline conditions, the start of the expression.
 A per-file inverted index stores the tests for each line as a bitset.
 Insertions use neighboring functions or file coverage. Fixture paths select
-their recorded readers. For likely equivalent Python edits, we apply the
-hunks to the original file and compare the full syntax trees. The comparison
-also recognizes identity/equality substitutions for certain inferred types.
-Those inferences can be wrong for dynamically assigned values. Tests recorded
-reading the file still run.
+their recorded readers. The selector compiles reconstructed Python and compares
+its syntax tree with the pinned original. For equality and identity it also
+requires static field evidence and compatible operand types observed at the
+same comparison during the clean test suite. Mixed enum and primitive values
+disable that inference. The optional Dockerfile.profile reproduces the type
+profile. The profile contains types and source locations. Tests recorded
+reading the file still run. Type profiling can miss a value on an unobserved
+execution path.
+
+Module and class changes also consult imports, multiline expression starts,
+and scalar class-attribute read sites. Test subprocess dependencies come from
+literal Python programs found in the pinned tests. Unresolved production
+Python changes fall back to broader selections.
 
 The scheduler sorts selected tests by duration and tries up to eight worker
 counts. It skips counts whose best possible cost already exceeds or ties the
 best schedule found. Each new test goes to the least-loaded worker.
+Bounded moves and swaps then try to reduce the longest worker time.
 
 ## Try it
 

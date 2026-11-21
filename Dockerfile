@@ -3,14 +3,16 @@ RUN git init /sqlglot && git -C /sqlglot fetch --depth 1 https://github.com/toby
 
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS indexer
 COPY --from=source /sqlglot/sqlglot /src/sqlglot
+COPY --from=source /sqlglot/tests /src/tests
 COPY --from=source /sqlglot/LICENSE /src/LICENSE
-COPY build_source_index.py /build_source_index.py
-RUN python /build_source_index.py /src /source-index.zip
+COPY build_source_index.py source_analysis.py /
+RUN python /build_source_index.py /src /source-index.zip && chmod 644 /source-index.zip
 
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 WORKDIR /app
 COPY coverage-map.json.gz /app/
-RUN python -c "import gzip, shutil; src = gzip.open('coverage-map.json.gz', 'rb'); dst = open('coverage-map.json', 'wb'); shutil.copyfileobj(src, dst); dst.close(); src.close()"
+RUN python -c "import gzip, os, shutil; src = gzip.open('coverage-map.json.gz', 'rb'); dst = open('coverage-map.json', 'wb'); shutil.copyfileobj(src, dst); dst.close(); src.close(); os.chmod('coverage-map.json', 0o644)"
 COPY --from=indexer /source-index.zip /app/source-index.zip
+COPY operand-profile.json.gz /app/
 COPY selector.py source_analysis.py coverage_index.py /app/
 CMD ["python", "/app/selector.py"]

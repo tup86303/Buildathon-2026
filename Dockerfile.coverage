@@ -1,7 +1,6 @@
 # Fetch only the public sqlglot repository at the pinned base revision.
 FROM alpine/git:v2.47.2@sha256:0d9a3a551058dba37ea77757955d3e834442ccf8540783671cc25c0d97957894 AS source
-RUN git clone https://github.com/tobymao/sqlglot.git /sqlglot \
-    && git -C /sqlglot checkout --detach eb11aec4be8cb2122afe713a4816662c3f0fb2fa
+RUN git init /sqlglot && git -C /sqlglot fetch --depth 1 https://github.com/tobymao/sqlglot.git eb11aec4be8cb2122afe713a4816662c3f0fb2fa && git -C /sqlglot checkout --detach FETCH_HEAD
 
 # Build per-test coverage against the exact source revision used by the scorer.
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS coverage
@@ -11,7 +10,7 @@ RUN python -m pip install --no-cache-dir -r /tmp/requirements.lock
 
 COPY --from=source /sqlglot /sqlglot
 
-COPY build_coverage.py build_coverage_plugin.py pool_coverage.py build_source_index.py /app/
+COPY build_coverage.py build_coverage_plugin.py pool_coverage.py build_source_index.py coverage_index.py source_analysis.py /app/
 RUN python /app/build_source_index.py /sqlglot /app/source-index.zip
 ENV PYTHONPATH=/app:/sqlglot
 ENV SQLGLOT_ROOT=/sqlglot
@@ -26,7 +25,9 @@ RUN cd /sqlglot \
     && SKIP_INTEGRATION=0 pytest -q -n 4 --cov=sqlglot --cov-context=test \
        --cov-report= -p build_coverage_plugin tests \
     && python /app/build_coverage.py /tmp/.coverage /tmp/coverage-access.tsv \
-       /sqlglot /app/coverage-map.json
+       /sqlglot /tmp/coverage-map-raw.json \
+    && python /app/coverage_index.py /tmp/coverage-map-raw.json /app/coverage-map.json \
+    && chmod 644 /app/coverage-map.json
 
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 COPY --from=coverage /app/source-index.zip /app/source-index.zip
