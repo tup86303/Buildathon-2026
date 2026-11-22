@@ -4,9 +4,9 @@ RUN git init /sqlglot && git -C /sqlglot fetch --depth 1 https://github.com/toby
 FROM python:3.13.18-trixie AS compiler
 COPY --from=source /sqlglot /sqlglot
 WORKDIR /sqlglot/sqlglotc
-ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 MYPYC_OPT=2
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0 MYPYC_OPT=1
 RUN pip install --no-cache-dir mypy==2.4.1 setuptools==84.2.1 setuptools-scm==10.3.4 wheel types-python-dateutil==2.9.0.20261116
-RUN sed -i "s|^SOURCE_FILES = _source_files(SRC_DIR)$|SOURCE_FILES = ['tokenizer_core.py', 'trie.py', 'helper.py', 'optimizer/scope.py', 'optimizer/qualify_columns.py', 'optimizer/annotate_types.py', 'errors.py', 'time.py', 'optimizer/resolver.py', 'optimizer/isolate_table_selects.py', 'optimizer/normalize_identifiers.py', 'optimizer/qualify.py', 'optimizer/qualify_tables.py']|" setup.py \
+RUN sed -i "s|^SOURCE_FILES = _source_files(SRC_DIR)$|SOURCE_FILES = ['tokenizer_core.py', 'trie.py', 'helper.py', 'optimizer/scope.py', 'optimizer/qualify_columns.py', 'optimizer/annotate_types.py', 'errors.py', 'time.py', 'optimizer/resolver.py', 'optimizer/isolate_table_selects.py', 'optimizer/normalize_identifiers.py', 'optimizer/qualify.py', 'optimizer/qualify_tables.py'] + _subpkg_files(SRC_DIR, 'expressions')|" setup.py \
     && python setup.py build_ext --inplace --parallel 4
 
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90 AS indexer

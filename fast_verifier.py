@@ -521,6 +521,13 @@ def probe_import_crash(
 
 
 _TPCDS_TEST_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+
+
+def _tpcds_query_order(pairs, baseline):
+    rank = {idx: position for position, idx in enumerate(baseline)}
+    return sorted(pairs, key=lambda pair: rank.get(pair[0], -1))
+
+
 _SQLGLOTC_EXACT = {
     "sqlglot/errors.py",
     "sqlglot/time.py",
@@ -536,7 +543,7 @@ _SQLGLOTC_EXACT = {
     "sqlglot/optimizer/qualify_columns.py",
     "sqlglot/optimizer/annotate_types.py",
 }
-_SQLGLOTC_PREFIXES = ()
+_SQLGLOTC_PREFIXES = ("sqlglot/expressions/",)
 
 
 def _choose_sqlglot_root(changes: list[dict], pure_root: Path) -> Path:
@@ -648,17 +655,16 @@ def verify_tpcds_differential(
 
             diff_queries: list[tuple[int, str]] = []
             _pairs = [(i, m, s) for i, (m, s, _) in enumerate(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql")) if m.get("execute")]
-            _pairs.sort(key=lambda x: len(x[2]))
-            for idx, meta, sql in _pairs:
+            for idx, _, sql in _tpcds_query_order(_pairs, base_by_idx):
                 expected = base_by_idx.get(idx)
                 if expected is None:
                     os.write(w_fd, b'{"prune":false}')
                     os._exit(0)
                 opt_sql = optimize(parse_one(sql), TPCDS_SCHEMA, leave_tables_isolated=True).sql()
-                duck_sql = transpile(sql, write="duckdb")[0]
                 oh = hashlib.blake2b(opt_sql.encode("utf-8"), digest_size=16).hexdigest()
-                dh = hashlib.blake2b(duck_sql.encode("utf-8"), digest_size=16).hexdigest()
-                if (oh, dh) != expected:
+                if oh != expected[0] or hashlib.blake2b(
+                    transpile(sql, write="duckdb")[0].encode("utf-8"), digest_size=16
+                ).hexdigest() != expected[1]:
                     diff_queries.append((idx, sql))
                     if len(diff_queries) > max_diff_exec:
                         os.write(w_fd, b'{"prune":false}')
@@ -1293,19 +1299,18 @@ def verify_commit_unified(
                         for i, (m, s, _) in enumerate(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
                         if m.get("execute")
                     ]
-                    _pairs.sort(key=lambda x: len(x[2]))
                     diff_queries: list[tuple[int, str]] = []
                     aborted_tpcds = False
-                    for idx_q, meta_q, sql_q in _pairs:
+                    for idx_q, _, sql_q in _tpcds_query_order(_pairs, base_by_idx):
                         expected = base_by_idx.get(idx_q)
                         if expected is None:
                             aborted_tpcds = True
                             break
                         opt_sql = optimize(parse_one(sql_q), TPCDS_SCHEMA, leave_tables_isolated=True).sql()
-                        duck_sql = transpile(sql_q, write="duckdb")[0]
                         oh = hashlib.blake2b(opt_sql.encode("utf-8"), digest_size=16).hexdigest()
-                        dh = hashlib.blake2b(duck_sql.encode("utf-8"), digest_size=16).hexdigest()
-                        if (oh, dh) != expected:
+                        if oh != expected[0] or hashlib.blake2b(
+                            transpile(sql_q, write="duckdb")[0].encode("utf-8"), digest_size=16
+                        ).hexdigest() != expected[1]:
                             diff_queries.append((idx_q, sql_q))
                             if len(diff_queries) > max_diff_exec:
                                 aborted_tpcds = True
