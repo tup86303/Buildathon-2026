@@ -11,13 +11,14 @@ RUN python -B /build_source_index.py /src /source-index.zip && chmod 644 /source
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
-ENV SELECTOR_FAST_VERIFY=0
-RUN pip install --no-cache-dir pytz==2026.6
-COPY coverage-map.json.gz dialect-profile.json.gz operand-profile.json.gz /app/
+ENV SELECTOR_FAST_VERIFY=1
+RUN pip install --no-cache-dir pytz==2026.6 duckdb==2.0.0 pandas==3.1.1 python-dateutil==4.0.0
+COPY coverage-map.json.gz dialect-profile.json.gz operand-profile.json.gz predicate-profile.json.gz /app/
 RUN python -B -c "import gzip, os, shutil; src = gzip.open('coverage-map.json.gz', 'rb'); dst = open('coverage-map.json', 'wb'); shutil.copyfileobj(src, dst); dst.close(); src.close(); os.chmod('coverage-map.json', 0o644); s2 = gzip.open('dialect-profile.json.gz', 'rb'); d2 = open('dialect-profile.json', 'wb'); shutil.copyfileobj(s2, d2); d2.close(); s2.close(); os.chmod('dialect-profile.json', 0o644)"
 COPY --from=indexer /source-index.zip /app/source-index.zip
 COPY --from=source /sqlglot/sqlglot /app/sqlglot_src/sqlglot
 COPY --from=source /sqlglot/tests /app/sqlglot_src/tests
-COPY selector.py source_analysis.py coverage_index.py fast_verifier.py verify_fast.py /app/
-RUN chmod -R a+rX /app
+COPY selector.py source_analysis.py coverage_index.py fast_verifier.py verify_fast.py predicate_eval.py build_tpcds_baseline.py /app/
+RUN python -B /app/build_tpcds_baseline.py /app/sqlglot_src /app/tpcds-baseline.json && python -B -c "import json, marshal; from pathlib import Path; Path('/app/coverage-map.marshal').write_bytes(marshal.dumps(json.loads(Path('/app/coverage-map.json').read_bytes())))"
+RUN python -m compileall -q /app /app/sqlglot_src && chmod -R a+rX /app
 CMD ["python", "-B", "/app/selector.py"]

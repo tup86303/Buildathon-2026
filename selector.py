@@ -5,13 +5,15 @@ from __future__ import annotations
 import ast
 import gzip
 import json
+import marshal
 import os
 import re
 import sys
 from pathlib import Path, PurePosixPath
 
 from coverage_index import LineIndex
-from fast_verifier import verify_fast_tests
+from fast_verifier import probe_import_crash, verify_commit_unified
+from predicate_eval import prune_unaffected_tests
 from source_analysis import SourceIndex
 
 APP = Path("/app")
@@ -186,8 +188,7 @@ def _expr_symbol_tests(path: str, changed_lines: set[int], coverage_map: dict, i
             return None
         matched.update(hits)
     func_classes = set(sym_data.get("func_classes", ()))
-    if matched & func_classes:
-        return set()  # sentinel: metaclass-registered Func subclass -> widen
+    func_sql_names = sym_data.get("func_sql_names", {})
     refs_map = sym_data.get("refs", {})
     if not matched or any(name not in refs_map for name in matched):
         return None
@@ -196,6 +197,22 @@ def _expr_symbol_tests(path: str, changed_lines: set[int], coverage_map: dict, i
     for name in matched:
         for ref_file, regions in refs_map[name].items():
             selected.update(_tests_covering_region(source, ref_file, [(s, e) for s, e in regions]))
+        if name in func_classes:
+            # Metaclass-registered Func subclass: union all Parser.FUNCTIONS + Generator.TRANSFORMS runtime users!
+            sql_names = func_sql_names.get(name, [name.upper()])
+            d_dict = coverage_map.get("dict_key_tests", {})
+            for d_rel, amap in d_dict.items():
+                fmap = amap.get("FUNCTIONS", {})
+                if fmap:
+                    selected.update(fmap.get("*", ()))
+                    for sn in sql_names:
+                        selected.update(fmap.get(f'const:"{sn}"', ()))
+                tmap = amap.get("TRANSFORMS", {})
+                if tmap:
+                    selected.update(tmap.get("*", ()))
+                    selected.update(tmap.get(f"type:{name}", ()))
+            selected.update(coverage_map.get("dialect_unprofiled", ()))
+            selected.update(coverage_map.get("attr_unprofiled", ()))
     return selected if selected else None
 
 
@@ -274,6 +291,13 @@ def _changed_source_tests(
             prefix = str(PurePosixPath(path).parent)
             prefix = "" if prefix == "." else prefix + "/"
             selected.update(t for t in test_ids if t.startswith(prefix))
+        pred_prof = coverage_map.get("predicate_profile")
+        if pred_prof and index is not None and selected and index._last_parsed is not None and index._last_parsed[0] == path:
+            try:
+                before_t = ast.parse(index.archive.read(path), type_comments=True)
+                selected = prune_unaffected_tests(path, before_t, index._last_parsed[2], selected, pred_prof)
+            except BaseException:
+                pass
         return selected or set(test_ids)
 
     if not path.startswith("sqlglot/") or not path.endswith(".py"):
@@ -319,8 +343,9 @@ def _changed_source_tests(
                         lines.add(st_ln)
     selected = _tests_covering_region(source_cov, path, [(line, line) for line in lines])
 
-    # Lazy-import crash-cascade protection (duckdb/bigquery import-time exp.maybe_parse)
-    if changed_lines:
+    # Lazy-import crash-cascade protection: only widen to tests/dialects/ on structural/module-scope changes
+    # (pure in-body expression edits like core.py:929 are already covered by line_index without dumping 869 unrelated dialect tests!)
+    if changed_lines and analysis == "structural":
         for d_rel, file_lines in coverage_map.get("lazy_import_lines", {}).items():
             traced = file_lines.get(path)
             if traced and (changed_lines & set(traced)):
@@ -494,7 +519,8 @@ def _select_tests(
             selected.update(coverage_map.get("access", {}).get(p, ()))
         analysis = index.analyze(change) if index is not None else "unknown"
         if analysis == "invalid":
-            return tests
+            selected = set(ids)
+            break
         if analysis != "equivalent":
             selected.update(_changed_source_tests(change, coverage_map, ids, index, analysis))
             if new_path and new_path != old_path and old_path:
@@ -506,8 +532,24 @@ def _select_tests(
         and os.environ.get("SELECTOR_FAST_VERIFY") != "0"
     ):
         sq_root = Path(os.environ.get("SELECTOR_SQLGLOT_ROOT", str(APP / "sqlglot_src")))
-        v_script = Path(__file__).with_name("verify_fast.py")
-        out = verify_fast_tests(changes, out, index, sq_root, v_script, disk_read_files=set(coverage_map.get('access', ())))
+        if len(out) == len(tests):
+            extra_keep: set[str] = set()
+            for ch in changes:
+                p = _normalized(ch.get("old"))
+                if p:
+                    extra_keep.update(_file_tests(p, coverage_map))
+                    if p.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")):
+                        d_name = Path(p).stem
+                        d_tests = coverage_map.get("dialect_tests", {})
+                        extra_keep.update(d_tests.get(d_name, ()))
+                        for sub_d in getattr(index, "dialect_subclasses", {}).get(d_name, ()):
+                            extra_keep.update(d_tests.get(sub_d, ()))
+            narrowed = probe_import_crash(changes, tests, index, sq_root, extra_keep_ids=extra_keep)
+            if narrowed is not None:
+                return narrowed
+        disk_files = set(coverage_map.get("access", ()))
+        tpcds_base = APP / "tpcds-baseline.json"
+        out = verify_commit_unified(changes, out, index, sq_root, tpcds_base, disk_read_files=disk_files)
     return out
 
 
@@ -532,10 +574,37 @@ def _split(tests: list[dict]) -> list[list[int]]:
                 continue
         workers: list[list[int]] = [[] for _ in range(worker_count)]
         loads = [0] * worker_count
+        worker_items: list[list[tuple[int, int]]] = [[] for _ in range(worker_count)]
         for number, duration in ordered:
             worker = loads.index(min(loads))
             workers[worker].append(number)
+            worker_items[worker].append((number, duration))
             loads[worker] += duration
+        # Fast 1-move local search to strictly improve makespan over greedy LPT when possible
+        if worker_count >= 2:
+            for _ in range(16):
+                hi = loads.index(max(loads))
+                lo = loads.index(min(loads))
+                gap = loads[hi] - loads[lo]
+                if gap <= 1:
+                    break
+                best_move = None
+                best_new_max = loads[hi]
+                for idx_it, (num, dur) in enumerate(worker_items[hi]):
+                    if dur < gap:
+                        new_lo = loads[lo] + dur
+                        if new_lo < best_new_max:
+                            best_new_max = new_lo
+                            best_move = (idx_it, num, dur)
+                if best_move is None:
+                    break
+                idx_it, num, dur = best_move
+                worker_items[hi].pop(idx_it)
+                workers[hi].pop(idx_it)
+                loads[hi] -= dur
+                worker_items[lo].append((num, dur))
+                workers[lo].append(num)
+                loads[lo] += dur
         cost = max(loads) + worker_cost
         if best_cost is None or cost < best_cost:
             best_cost = cost
@@ -546,7 +615,8 @@ def _split(tests: list[dict]) -> list[list[int]]:
 def main() -> None:
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ids = [test["id"] for test in tests]
-    coverage_map = json.loads((APP / "coverage-map.json").read_text())
+    _cm_m = APP / "coverage-map.marshal"
+    coverage_map = marshal.loads(_cm_m.read_bytes()) if _cm_m.is_file() else json.loads((APP / "coverage-map.json").read_text())
     profile = json.loads((APP / "dialect-profile.json").read_text()) if (APP / "dialect-profile.json").is_file() else json.loads(gzip.decompress((APP / "dialect-profile.json.gz").read_bytes()))
     coverage_map["dialect_users"] = profile.get("dialect_tests", {})
     coverage_map["tokenizer_users"] = profile.get("tokenizer_tests", {})
@@ -559,6 +629,9 @@ def main() -> None:
     coverage_map["dialect_unprofiled"] = profile.get("unprofiled", [])
     coverage_map["attr_unprofiled"] = profile.get("attr_unprofiled", [])
     coverage_map["lazy_import_lines"] = profile.get("lazy_import_lines", {})
+    pred_p = APP / "predicate-profile.json.gz"
+    if pred_p.is_file():
+        coverage_map["predicate_profile"] = json.loads(gzip.decompress(pred_p.read_bytes()))
     if "line_index" in coverage_map:
         coverage_map["source"] = {p: LineIndex(v) for p, v in coverage_map.pop("line_index").items()}
     index = SourceIndex(APP / "source-index.zip")

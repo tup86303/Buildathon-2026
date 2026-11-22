@@ -36,6 +36,156 @@ def _annotation_names(annotation):
     return {"?"}
 
 
+
+_SCOPE_NODES = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+_BLOCK_NODES = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try, ast.Match)
+
+
+def _is_type_checking_guard(test: ast.AST) -> bool:
+    if isinstance(test, ast.Name) and test.id == "TYPE_CHECKING":
+        return True
+    if (
+        isinstance(test, ast.Attribute)
+        and test.attr == "TYPE_CHECKING"
+        and isinstance(test.value, ast.Name)
+        and test.value.id in ("t", "typing", "typing_extensions")
+    ):
+        return True
+    return False
+
+
+def _is_overload_func(stmt: ast.stmt) -> bool:
+    if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    for dec in stmt.decorator_list:
+        if isinstance(dec, ast.Name) and dec.id == "overload":
+            return True
+        if (
+            isinstance(dec, ast.Attribute)
+            and dec.attr == "overload"
+            and isinstance(dec.value, ast.Name)
+            and dec.value.id in ("t", "typing", "typing_extensions")
+        ):
+            return True
+    return False
+
+
+def _clean_stmt_list(stmts: list[ast.stmt], in_func: bool) -> list[ast.stmt]:
+    out: list[ast.stmt] = []
+    for stmt in stmts:
+        if _is_overload_func(stmt):
+            continue
+        if isinstance(stmt, ast.If) and _is_type_checking_guard(stmt.test):
+            if stmt.orelse:
+                out.extend(_clean_stmt_list(stmt.orelse, in_func))
+            continue
+        if in_func and isinstance(stmt, ast.AnnAssign):
+            if stmt.value is not None:
+                # Preserve exact source span for _function_block_hashes
+                new_node = ast.copy_location(ast.Assign(targets=[stmt.target], value=stmt.value), stmt)
+                out.append(new_node)
+            continue
+        out.append(stmt)
+    return out
+
+
+def _has_future_annotations(tree: ast.AST) -> bool:
+    if not isinstance(tree, ast.Module):
+        return False
+    for stmt in tree.body[:8]:
+        if isinstance(stmt, ast.ImportFrom) and stmt.module == "__future__":
+            if any(a.name == "annotations" for a in stmt.names):
+                return True
+    return False
+
+
+def _strip_func_annotations(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+    fn.returns = None
+    args = fn.args
+    for a in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+        a.annotation = None
+    if args.vararg is not None:
+        args.vararg.annotation = None
+    if args.kwarg is not None:
+        args.kwarg.annotation = None
+
+
+def _strip_docstrings(tree: ast.AST, strip_types: bool = False) -> None:
+    """Remove provably dead-at-runtime AST nodes in-place in O(#scopes):
+    1. Module/class/function docstrings (0 tests in tests.json read __doc__ or run doctest).
+    2. `if [t.|typing.]TYPE_CHECKING:` blocks & `@overload` stubs (never executed at runtime).
+    3. Function-local PEP 526 AnnAssign annotations (never evaluated or stored at runtime).
+    4. Function param/return annotations when `from __future__ import annotations` is active."""
+    future_ann = strip_types and _has_future_annotations(tree)
+    stack: list[tuple[ast.AST, bool]] = [(tree, False)]
+    while stack:
+        node, in_func = stack.pop()
+        if isinstance(node, _SCOPE_NODES):
+            is_fn = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            if is_fn and future_ann:
+                _strip_func_annotations(node)
+            child_in_func = in_func or is_fn
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                body = body[1:]
+            if strip_types:
+                body = _clean_stmt_list(body, child_in_func)
+            node.body = body
+            for stmt in body:
+                if isinstance(stmt, (_SCOPE_NODES, _BLOCK_NODES)):
+                    stack.append((stmt, child_in_func))
+        else:
+            for attr in ("body", "orelse", "finalbody"):
+                sub = getattr(node, attr, None)
+                if sub:
+                    cleaned = _clean_stmt_list(sub, in_func) if strip_types else sub
+                    setattr(node, attr, cleaned)
+                    for stmt in cleaned:
+                        if isinstance(stmt, (_SCOPE_NODES, _BLOCK_NODES)):
+                            stack.append((stmt, in_func))
+            for h in getattr(node, "handlers", ()):
+                if strip_types:
+                    h.body = _clean_stmt_list(h.body, in_func)
+                for stmt in h.body:
+                    if isinstance(stmt, (_SCOPE_NODES, _BLOCK_NODES)):
+                        stack.append((stmt, in_func))
+            for c in getattr(node, "cases", ()):
+                if strip_types:
+                    c.body = _clean_stmt_list(c.body, in_func)
+                for stmt in c.body:
+                    if isinstance(stmt, (_SCOPE_NODES, _BLOCK_NODES)):
+                        stack.append((stmt, in_func))
+
+
+def _hash_code(co, h) -> None:
+    h.update(co.co_code)
+    h.update(repr((
+        co.co_names,
+        co.co_varnames,
+        co.co_freevars,
+        co.co_cellvars,
+        co.co_argcount,
+        co.co_posonlyargcount,
+        co.co_kwonlyargcount,
+        co.co_flags,
+        co.co_name,
+    )).encode("utf-8"))
+    for c in co.co_consts:
+        if hasattr(c, "co_code"):
+            h.update(b"<CODE>")
+            _hash_code(c, h)
+        else:
+            h.update(type(c).__name__.encode("utf-8"))
+            h.update(b":")
+            h.update(repr(c).encode("utf-8"))
+            h.update(b";")
+
+
 def _signature(tree, identity_classes, enum_fields, sites=None):
     id_cls: set[str] = set()
     classes: list[ast.ClassDef] = []
@@ -98,6 +248,7 @@ def _signature(tree, identity_classes, enum_fields, sites=None):
                     cmp.ops[0] = ast.Is()
                 elif isinstance(cmp.ops[0], ast.NotEq):
                     cmp.ops[0] = ast.IsNot()
+    _strip_docstrings(tree, strip_types=True)
     if hasattr(tree, "type_ignores"):
         tree.type_ignores = []
     return hashlib.blake2b(ast.dump(tree, include_attributes=False).encode("utf-8"), digest_size=16).hexdigest()
@@ -139,6 +290,7 @@ def _control_flow_hash(tree) -> str:
 
 
 def _function_block_hashes(tree: ast.AST) -> dict[str, tuple[int, int, str]]:
+    _strip_docstrings(tree)
     blocks: dict[str, tuple[int, int, str]] = {}
     dups: set[str] = set()
 
@@ -433,18 +585,15 @@ class SourceIndex:
         has_special = any(SPECIAL_COMMENT_RE.search(s) for s in edits)
         has_coding = any(CODING_RE.match(l) for l in raw.splitlines()[:2])
         if not has_special and not has_coding:
-            has_eq_or_fmt = any(
-                "#" in s or "None" in s or " is " in s or "==" in s or "!=" in s or not s.strip()
-                for s in edits
-            )
+            has_eq_or_fmt = True
             if has_eq_or_fmt:
                 before_sig = self._sig_hashes.get(path)
-                if before_sig is not None and _signature(tree, self.identity_classes, self.enum_fields) == before_sig:
+                if before_sig is not None and _signature(ast.parse(raw, type_comments=True), self.identity_classes, self.enum_fields) == before_sig:
                     return "equivalent"
                 if any("None" in s or " is " in s or "==" in s or "!=" in s for s in edits):
                     sites = self.profile_sites.get(path)
                     if sites:
-                        if _signature(tree, self.identity_classes, self.enum_fields, sites=sites) == self._original_profile_signature(path):
+                        if _signature(ast.parse(raw, type_comments=True), self.identity_classes, self.enum_fields, sites=sites) == self._original_profile_signature(path):
                             return "equivalent"
 
         return "changed"

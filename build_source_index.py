@@ -126,7 +126,27 @@ def _build_expr_symbols(root: Path) -> dict:
             compact[rf] = merged
         merged_refs[sym] = compact
 
-    return {"classes": dict(expr_classes), "refs": merged_refs, "func_classes": sorted(func_classes)}
+    # Map each Func subclass to its uppercase SQL function name(s) for exact Parser.FUNCTIONS lookup
+    func_sql_names: dict[str, list[str]] = {}
+    for f in sorted(expr_dir.rglob("*.py")):
+        if f.name == "__init__.py":
+            continue
+        try:
+            t_f = ast.parse(f.read_bytes())
+        except SyntaxError:
+            continue
+        for node in t_f.body:
+            if isinstance(node, ast.ClassDef) and node.name in func_classes:
+                names_set = {node.name.upper()}
+                for stmt in node.body:
+                    if isinstance(stmt, ast.Assign):
+                        for tgt in stmt.targets:
+                            if isinstance(tgt, ast.Name) and tgt.id == "_sql_names" and isinstance(stmt.value, (ast.List, ast.Tuple, ast.Set)):
+                                for elt in stmt.value.elts:
+                                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                                        names_set.add(elt.value.upper())
+                func_sql_names[node.name] = sorted(names_set)
+    return {"classes": dict(expr_classes), "refs": merged_refs, "func_classes": sorted(func_classes), "func_sql_names": func_sql_names}
 
 
 def build(root: Path, destination: Path) -> None:
@@ -155,7 +175,7 @@ def build(root: Path, destination: Path) -> None:
         if mod:
             known_modules[mod] = rel
 
-    with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:
+    with zipfile.ZipFile(destination, "w", zipfile.ZIP_STORED) as archive:
         for file in sqlglot_files + test_files:
             raw = file.read_bytes()
             rel = file.relative_to(root).as_posix()
