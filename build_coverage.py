@@ -29,17 +29,10 @@ def _function_map(root: Path) -> dict[str, list[dict]]:
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 starts = [node.lineno, *(item.lineno for item in node.decorator_list)]
-                calls = {
-                    call.func.id if isinstance(call.func, ast.Name) else call.func.attr
-                    for call in ast.walk(node)
-                    if isinstance(call, ast.Call) and isinstance(call.func, (ast.Name, ast.Attribute))
-                }
                 functions.append(
                     {
                         "start": min(starts),
                         "end": node.end_lineno or node.lineno,
-                        "name": node.name,
-                        "calls": sorted(calls),
                     }
                 )
         relative = _relative(str(path), root)
@@ -49,11 +42,15 @@ def _function_map(root: Path) -> dict[str, list[dict]]:
 
 
 def _coverage(path: Path, root: Path) -> dict[str, dict[str, list[int]]]:
-    from coverage import Coverage
+    from coverage import Coverage, CoverageData
 
     coverage = Coverage(data_file=str(path))
     coverage.load()
     data = coverage.get_data()
+    for worker_file in path.parent.glob(path.name + "-pool.*"):
+        worker = CoverageData(basename=str(worker_file))
+        worker.read()
+        data.update(worker)
     result: dict[str, dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
     for measured_file in data.measured_files():
         relative = _relative(measured_file, root)
@@ -61,8 +58,8 @@ def _coverage(path: Path, root: Path) -> dict[str, dict[str, list[int]]]:
             continue
         for line, contexts in data.contexts_by_lineno(measured_file).items():
             for context in contexts:
-                if context.endswith("|run"):
-                    test_id = context[:-4]
+                test_id, _, phase = context.rpartition("|")
+                if test_id and phase in {"setup", "run", "teardown"}:
                     result[relative][test_id].add(line)
     return {
         file: {test_id: sorted(lines) for test_id, lines in tests.items()}

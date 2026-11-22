@@ -27,19 +27,33 @@ Lower is better. [SCORING.md](SCORING.md) has the exact rules; in short:
 
 ## Selection strategy
 
-During the image build, the Dockerfile checks out sqlglot at the pinned base
-revision and runs its tests with per-test coverage contexts. It saves the
-source lines each test executes, plus non-Python files read while each test is
-running. At runtime, the selector parses each patch and schedules tests that
-execute changed source lines, or the changed function when no test covers the
-exact lines. Changed fixtures select tests that read them, and module-level
-edits fall back to tests for that module. Dialect and optimizer changes add
-targeted related tests; executor tests are excluded unless the patch touches
-executor behavior or a fixture they read. This mapping comes only from the
-pinned source and test run; it does not contain patch-specific answers.
+The default Docker build fetches the pinned SQLGlot revision, packages its
+Python sources and type information, and unpacks the team's measured coverage
+map. Build-time inputs include the organizer's starter kit and SQLGlot (MIT).
+The source archive contains the upstream license.
 
-Selected tests are greedily balanced over the worker count with the lowest
-estimated cost, including the scorer's two-second worker overhead.
+The selector uses Windows line coverage and the union of Windows and Linux file-reader observations. We collected the Windows map with SQLGlot's executor integration enabled.
+It combines per-test line coverage, recorded file reads, and separate traces
+for worker processes. Worker traces include result serialization, which can
+execute SQLGlot code after the worker function returns. Platform or dependency
+differences can affect coverage. The optional `Dockerfile.coverage` rebuilds
+coverage from the pinned source on Linux.
+
+For a replacement inside a function, the selector looks up tests covering the
+changed lines and, for multiline conditions, the start of the expression.
+A per-file inverted index stores the tests for each line as a bitset.
+Insertions use neighboring functions or file coverage. Fixture paths select
+their recorded readers. For likely equivalent Python edits, we apply the
+hunks to the original file and compare the full syntax trees. The comparison
+also recognizes identity/equality substitutions for certain inferred types.
+Those inferences can be wrong for dynamically assigned values. Tests recorded
+reading the file still run.
+
+The scheduler sorts selected tests by duration and tries up to eight worker
+counts. It skips counts whose best possible cost already exceeds or ties the
+best schedule found. Each new test goes to the least-loaded worker.
+
+Before selection, the image compiles reconstructed production Python without executing it. A compile failure selects the full manifest. Edits to scalar dialect settings also select baseline tests observed using that dialect or its subclasses. The offline dialect profile records positive evidence only.
 
 ## Try it
 
@@ -61,7 +75,7 @@ Push to a public GitHub repository with the `Dockerfile` at its top, then enter 
 ## Rules
 
 - Submit your own team's repository. A submission with the same repository, commit or archive as another team's is disqualified, the later one.
-- Your build may download only from public package registries: PyPI, npm, Docker Hub, GitHub releases at a fixed tag, and sqlglot’s own repository at the pinned commit. Nothing from an address your team controls. The final rebuilds every image after the cutoff, so anything else could change a submission after the deadline.
+- Your build may download only from public package registries: PyPI, npm, Docker Hub, GitHub releases at a fixed tag, and sqlglotâ€™s own repository at the pinned commit. Nothing from an address your team controls. The final rebuilds every image after the cutoff, so anything else could change a submission after the deadline.
 - No answers worked out ahead of time and looked up by patch: no table from a patch, or from a kind of edit, to the tests it breaks. Maps built from the pinned commit (coverage, imports, fixtures) are allowed. Top entries are read.
 - Only the final counts. The practice board carries no prize.
 
