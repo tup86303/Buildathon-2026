@@ -1061,20 +1061,21 @@ def verify_commit_unified(
         return selected
 
     sel_ids = {t["id"] for t in selected}
-    touches_serde = any(
-        (ch.get("old") == "sqlglot/serde.py" or ch.get("new") == "sqlglot/serde.py")
-        for ch in changes
+    touches_pickle_risk = any(
+        path == "sqlglot/serde.py" or path.startswith("sqlglot/expressions/")
+        for change in changes
+        for path in (change.get("old") or "", change.get("new") or "")
     )
     check_tpch_exec = _TPCH_EXEC_TEST_ID in sel_ids
     check_tpch_opt = _TPCH_OPT_TEST_ID in sel_ids and baseline_path.is_file()
     changed_dialects = _changed_dialect_names(changes)
-    check_canon = (_CANONICALIZE_TEST_ID in sel_ids) and not touches_serde
-    check_merge = (_MERGE_SUBQ_TEST_ID in sel_ids) and not touches_serde
+    check_canon = (_CANONICALIZE_TEST_ID in sel_ids) and not touches_pickle_risk
+    check_merge = (_MERGE_SUBQ_TEST_ID in sel_ids) and not touches_pickle_risk
     check_schema_cache = _SCHEMA_CACHE_TEST_ID in sel_ids
-    check_agg_order = (_AGG_ORDER_TEST_ID in sel_ids) and not touches_serde
+    check_agg_order = (_AGG_ORDER_TEST_ID in sel_ids) and not touches_pickle_risk
 
     # Check if Differential TPC-DS is eligible
-    check_tpcds = (_TPCDS_TEST_ID in sel_ids) and baseline_path.is_file()
+    check_tpcds = (_TPCDS_TEST_ID in sel_ids) and baseline_path.is_file() and not touches_pickle_risk
     if check_tpcds:
         for ch in changes:
             old_p = ch.get("old", "")
@@ -1107,7 +1108,7 @@ def verify_commit_unified(
         and not any(
             (t["id"].startswith(_EXCLUDED_PREFIXES) and t["id"] not in (_TPCDS_TEST_ID, _TPCH_EXEC_TEST_ID, _TPCH_OPT_TEST_ID, _AGG_ORDER_TEST_ID))
             or t["id"] in _EXCLUDED_IDS
-            or (touches_serde and t["id"].startswith("tests/test_optimizer.py::"))
+            or (touches_pickle_risk and t["id"].startswith("tests/test_optimizer.py::"))
             for t in selected
         )
     )
@@ -1365,7 +1366,7 @@ def verify_commit_unified(
                 and not any(
                     tid.startswith(_EXCLUDED_PREFIXES)
                     or tid in _EXCLUDED_IDS
-                    or (touches_serde and tid.startswith("tests/test_optimizer.py::"))
+                    or (touches_pickle_risk and tid.startswith("tests/test_optimizer.py::"))
                     for tid, _ in rem_items
                 )
             ):

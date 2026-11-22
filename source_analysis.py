@@ -248,7 +248,7 @@ def _signature(tree, identity_classes, enum_fields, sites=None):
                     cmp.ops[0] = ast.Is()
                 elif isinstance(cmp.ops[0], ast.NotEq):
                     cmp.ops[0] = ast.IsNot()
-    _strip_docstrings(tree, strip_types=True)
+    _strip_docstrings(tree)
     if hasattr(tree, "type_ignores"):
         tree.type_ignores = []
     return hashlib.blake2b(ast.dump(tree, include_attributes=False).encode("utf-8"), digest_size=16).hexdigest()

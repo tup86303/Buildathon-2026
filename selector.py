@@ -540,10 +540,10 @@ def _select_tests(
                     extra_keep.update(_file_tests(p, coverage_map))
                     if p.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")):
                         d_name = Path(p).stem
-                        d_tests = coverage_map.get("dialect_tests", {})
-                        extra_keep.update(d_tests.get(d_name, ()))
+                        d_tests = coverage_map.get("dialect_users", {})
+                        extra_keep.update(d_tests.get(f"sqlglot/dialects/{d_name}.py", ()))
                         for sub_d in getattr(index, "dialect_subclasses", {}).get(d_name, ()):
-                            extra_keep.update(d_tests.get(sub_d, ()))
+                            extra_keep.update(d_tests.get(f"sqlglot/dialects/{sub_d}.py", ()))
             narrowed = probe_import_crash(changes, tests, index, sq_root, extra_keep_ids=extra_keep)
             if narrowed is not None:
                 return narrowed
@@ -631,12 +631,6 @@ def main() -> None:
     coverage_map["dialect_unprofiled"] = profile.get("unprofiled", [])
     coverage_map["attr_unprofiled"] = profile.get("attr_unprofiled", [])
     coverage_map["lazy_import_lines"] = profile.get("lazy_import_lines", {})
-    _pp_m = APP / "predicate-profile.marshal"
-    pred_p = APP / "predicate-profile.json.gz"
-    if _pp_m.is_file():
-        coverage_map["predicate_profile"] = marshal.loads(_pp_m.read_bytes())
-    elif pred_p.is_file():
-        coverage_map["predicate_profile"] = json.loads(gzip.decompress(pred_p.read_bytes()))
     if "line_index" in coverage_map:
         coverage_map["source"] = {p: LineIndex(v) for p, v in coverage_map.pop("line_index").items()}
     index = SourceIndex(APP / "source-index.zip")
