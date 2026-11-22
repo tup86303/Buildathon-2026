@@ -419,7 +419,7 @@ def probe_import_crash(
     """When a pure sqlglot/*.py edit triggers a full-suite fallback (syntax/import/scalar crash),
     probe importing the patched module(s) and all test files in a clean os.fork() child.
     If any patched module actually crashes at import time, return exact failed-import test files
-    unioned with extra_keep_ids (dialect/file coverage) — dropping unrelated heavy tests like
+    unioned with extra_keep_ids (dialect/file coverage) â€” dropping unrelated heavy tests like
     test_max_nodes (28.8s) and test_execute_tpcds (21.5s) with 0 misses.
     Returns None if no import crash occurred or probing is not applicable."""
     if not tests or not sqlglot_root.is_dir():
@@ -522,33 +522,21 @@ def probe_import_crash(
 
 _TPCDS_TEST_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 _SQLGLOTC_EXACT = {
-    "sqlglot/anonymize.py",
     "sqlglot/errors.py",
-    "sqlglot/generator.py",
-    "sqlglot/helper.py",
-    "sqlglot/lineage.py",
-    "sqlglot/parser.py",
-    "sqlglot/serde.py",
     "sqlglot/time.py",
-    "sqlglot/tokenizer_core.py",
-    "sqlglot/trie.py",
-    "sqlglot/executor/table.py",
-    "sqlglot/optimizer/scope.py",
     "sqlglot/optimizer/resolver.py",
     "sqlglot/optimizer/isolate_table_selects.py",
     "sqlglot/optimizer/normalize_identifiers.py",
     "sqlglot/optimizer/qualify.py",
     "sqlglot/optimizer/qualify_tables.py",
+    "sqlglot/helper.py",
+    "sqlglot/tokenizer_core.py",
+    "sqlglot/trie.py",
+    "sqlglot/optimizer/scope.py",
     "sqlglot/optimizer/qualify_columns.py",
-    "sqlglot/optimizer/simplify.py",
     "sqlglot/optimizer/annotate_types.py",
-    "sqlglot/optimizer/canonicalize_internal_names.py",
 }
-_SQLGLOTC_PREFIXES = (
-    "sqlglot/expressions/",
-    "sqlglot/generators/",
-    "sqlglot/parsers/",
-)
+_SQLGLOTC_PREFIXES = ()
 
 
 def _choose_sqlglot_root(changes: list[dict], pure_root: Path) -> Path:
@@ -557,9 +545,9 @@ def _choose_sqlglot_root(changes: list[dict], pure_root: Path) -> Path:
     if not c_root.is_dir():
         return pure_root
     for ch in changes:
-        p = ch.get("old") or ch.get("new") or ""
-        if p in _SQLGLOTC_EXACT or p.startswith(_SQLGLOTC_PREFIXES):
-            return pure_root
+        for path in (ch.get("old") or "", ch.get("new") or ""):
+            if path in _SQLGLOTC_EXACT or path.startswith(_SQLGLOTC_PREFIXES):
+                return pure_root
     return c_root
 
 
@@ -569,11 +557,11 @@ def verify_tpcds_differential(
     index,
     sqlglot_root: Path,
     baseline_path: Path,
-    max_diff_exec: int = 3,
+    max_diff_exec: int = 1,
     disk_read_files: set[str] | None = None,
 ) -> list[dict]:
     """Prune test_execute_tpcds (21.454s) when a non-executor commit leaves all 57 executed
-    TPC-DS optimized plans + duckdb transpiles identical — or when <= max_diff_exec queries
+    TPC-DS optimized plans + duckdb transpiles identical â€” or when <= max_diff_exec queries
     differ and all differing queries pass live execution against DuckDB."""
     if not any(t["id"] == _TPCDS_TEST_ID for t in selected):
         return selected
@@ -1057,12 +1045,12 @@ def verify_commit_unified(
     max_total_seconds: float = 1.00,
     max_tests: int = 15,
     early_abort_rem_sec: float = 0.80,
-    max_diff_exec: int = 3,
+    max_diff_exec: int = 1,
     disk_read_files: set[str] | None = None,
 ) -> list[dict]:
     """Single-fork unified verifier: pays ONE os.fork() + ONE import sqlglot per commit
     for high-ROI tests (177x/44x/18x/2.7x), Differential TPC-DS (21.454s), AND full-commit
-    zero-out verification — eliminating duplicate imports and unlocking cascading zero-outs."""
+    zero-out verification â€” eliminating duplicate imports and unlocking cascading zero-outs."""
     if not selected or not sqlglot_root.is_dir():
         return selected
 
