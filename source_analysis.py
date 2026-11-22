@@ -383,6 +383,11 @@ class SourceIndex:
     def original_lines(self, path: str):
         return self.archive.read(path).decode("utf-8").splitlines(keepends=True)
 
+    @lru_cache(maxsize=64)
+    def _original_profile_signature(self, path: str) -> str:
+        tree = ast.parse(self.archive.read(path), type_comments=True)
+        return _signature(tree, self.identity_classes, self.enum_fields, sites=self.profile_sites[path])
+
     def reconstruct(self, change: dict) -> bytes | None:
         path = change["old"]
         if path != change["new"] or not path.endswith(".py") or not change["hunks"]:
@@ -439,8 +444,7 @@ class SourceIndex:
                 if any("None" in s or " is " in s or "==" in s or "!=" in s for s in edits):
                     sites = self.profile_sites.get(path)
                     if sites:
-                        before_tree = ast.parse(self.archive.read(path), type_comments=True)
-                        if _signature(tree, self.identity_classes, self.enum_fields, sites=sites) == _signature(before_tree, self.identity_classes, self.enum_fields, sites=sites):
+                        if _signature(tree, self.identity_classes, self.enum_fields, sites=sites) == self._original_profile_signature(path):
                             return "equivalent"
 
         return "changed"
