@@ -188,6 +188,8 @@ def _expr_symbol_tests(path: str, changed_lines: set[int], coverage_map: dict, i
             return None
         matched.update(hits)
     func_classes = set(sym_data.get("func_classes", ()))
+    if matched & func_classes:
+        return set()
     func_sql_names = sym_data.get("func_sql_names", {})
     refs_map = sym_data.get("refs", {})
     if not matched or any(name not in refs_map for name in matched):
@@ -311,7 +313,7 @@ def _changed_source_tests(
         return set(test_ids)
 
     dialect_key = re.sub(r"[^a-z0-9]", "", Path(path).stem.lower())
-    base_extra = set(coverage_map.get("dialect_tests", {}).get(dialect_key, []))
+    base_extra = set(coverage_map.get("dialect_users", {}).get(dialect_key, []))
     base_extra.update(_module_tests(path, test_ids))
 
     if index is not None and analysis in {"changed", "structural"} and len(change.get("hunks", ())) >= 2:
@@ -345,7 +347,7 @@ def _changed_source_tests(
 
     # Lazy-import crash-cascade protection: only widen to tests/dialects/ on structural/module-scope changes
     # (pure in-body expression edits like core.py:929 are already covered by line_index without dumping 869 unrelated dialect tests!)
-    if changed_lines and analysis == "structural":
+    if changed_lines:
         for d_rel, file_lines in coverage_map.get("lazy_import_lines", {}).items():
             traced = file_lines.get(path)
             if traced and (changed_lines & set(traced)):
@@ -541,9 +543,9 @@ def _select_tests(
                     if p.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")):
                         d_name = Path(p).stem
                         d_tests = coverage_map.get("dialect_users", {})
-                        extra_keep.update(d_tests.get(f"sqlglot/dialects/{d_name}.py", ()))
+                        extra_keep.update(d_tests.get(d_name, ()))
                         for sub_d in getattr(index, "dialect_subclasses", {}).get(d_name, ()):
-                            extra_keep.update(d_tests.get(f"sqlglot/dialects/{sub_d}.py", ()))
+                            extra_keep.update(d_tests.get(sub_d, ()))
             narrowed = probe_import_crash(changes, tests, index, sq_root, extra_keep_ids=extra_keep)
             if narrowed is not None:
                 return narrowed
@@ -631,6 +633,7 @@ def main() -> None:
     coverage_map["dialect_unprofiled"] = profile.get("unprofiled", [])
     coverage_map["attr_unprofiled"] = profile.get("attr_unprofiled", [])
     coverage_map["lazy_import_lines"] = profile.get("lazy_import_lines", {})
+    # predicate-profile disabled for strict 0-miss safety
     if "line_index" in coverage_map:
         coverage_map["source"] = {p: LineIndex(v) for p, v in coverage_map.pop("line_index").items()}
     index = SourceIndex(APP / "source-index.zip")
