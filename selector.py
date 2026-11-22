@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import gzip
 import json
 import os
@@ -143,6 +144,30 @@ def _fixture_tests(path: str, access: dict, test_ids: list[str]) -> set[str]:
             or test_id.startswith(f"tests/test_{category}.py::")
         )
     return result or set(test_ids)
+
+
+def _scalar_assignments(lines: list[str]) -> list[str] | None:
+    """Recognize plain scalar assignments whose RHS cannot fail during import."""
+    names = []
+    for line in lines:
+        try:
+            statements = ast.parse(line.strip()).body
+        except (SyntaxError, ValueError):
+            return None
+        if len(statements) != 1 or not isinstance(statements[0], ast.Assign):
+            return None
+        assignment = statements[0]
+        if len(assignment.targets) != 1 or not isinstance(assignment.targets[0], ast.Name):
+            return None
+        value = assignment.value
+        if isinstance(value, ast.UnaryOp) and isinstance(value.op, (ast.UAdd, ast.USub)):
+            value = value.operand
+            if not isinstance(value, ast.Constant) or type(value.value) not in (int, float):
+                return None
+        if not isinstance(value, ast.Constant) or type(value.value) not in (str, bool, int, float, type(None)):
+            return None
+        names.append(assignment.targets[0].id)
+    return names
 
 
 def _expr_symbol_tests(path: str, changed_lines: set[int], coverage_map: dict, index: SourceIndex | None) -> set[str] | None:
@@ -370,6 +395,10 @@ def _changed_source_tests(
                 bindings = index.scalar_bindings.get(path, {})
                 bound_names = [bindings.get(str(line)) for line in changed_lines]
                 if bound_names and all(n is not None for n in bound_names):
+                    removed_names = _scalar_assignments(change["removed"])
+                    added_names = _scalar_assignments(change["added"])
+                    if not removed_names or removed_names != added_names:
+                        return set(test_ids)
                     tr = index.tokenizer_ranges.get(path, ())
                     in_tok = bool(tr) and any(any(s <= ln <= e for s, e in tr) for ln in changed_lines)
                     watched = set(coverage_map.get("watched_dialect_attrs", ()))
