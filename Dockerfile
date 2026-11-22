@@ -35,5 +35,5 @@ RUN python -c "import gzip, json, marshal, pathlib; \
    for src, dst in [('/app/dialect-profile.json.gz','/app/dialect-profile.marshal'),('/app/predicate-profile.json.gz','/app/predicate-profile.marshal'),('/app/tpcds-baseline.json','/app/tpcds-baseline.marshal')] \
    if pathlib.Path(src).is_file()]"
 RUN python -m compileall -q /app /app/sqlglot_src /app/sqlglot_c && chmod -R a+rX /app
-ENV SELECTOR_FAST_VERIFY=0
+
 CMD ["python", "-B", "/app/selector.py"]
