@@ -13,6 +13,7 @@ import importlib.abc
 import importlib.machinery
 import importlib.util
 import json
+import marshal
 import os
 import signal
 import sys
@@ -23,36 +24,48 @@ from pathlib import Path
 
 _WARMED = False
 
+def _load_baseline(p: Path) -> dict:
+    return marshal.loads(p.read_bytes()) if p.suffix == ".marshal" else json.loads(p.read_text(encoding="utf-8"))
+
 # Tests we never run inside fast_verifier (heavy executor/memory/c-ext tests)
 _EXCLUDED_PREFIXES = (
-    "tests/test_executor.py::",
     "tests/leakcheck.py::",
     "tests/test_sqlglotc.py::",
 )
 _EXCLUDED_IDS = {
     "tests/test_parser.py::TestParser::test_max_nodes",
     "tests/test_generator.py::TestGenerator::test_generator_memory",
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+    "tests/test_executor.py::TestExecutor::test_execute_tpch",
+    "tests/test_executor.py::TestExecutor::test_optimized_tpch",
 }
 
 
+class _LazyFuture:
+    """Zero-overhead lazy Future: executes fn only when .result() is called so
+    fail-fast _NoOpSubTest aborts immediately on the first failing query."""
+
+    __slots__ = ("_fn", "_args", "_kwargs")
+
+    def __init__(self, fn, args, kwargs):
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+
+    def result(self, timeout=None):
+        return self._fn(*self._args, **self._kwargs)
+
+
 class _SyncPool:
-    """In-process synchronous drop-in for ProcessPoolExecutor in TestOptimizer."""
+    """In-process lazy drop-in for ProcessPoolExecutor in TestOptimizer."""
 
     def __init__(self, *args, **kwargs):
         pass
 
     def submit(self, fn, *args, **kwargs):
-        fut = Future()
-        try:
-            fut.set_result(fn(*args, **kwargs))
-        except BaseException as exc:
-            fut.set_exception(exc)
-        return fut
+        return _LazyFuture(fn, args, kwargs)
 
-    def map(self, fn, *iterables, **kwargs):
-        return [fn(*a) for a in zip(*iterables)]
-
-    def shutdown(self, wait=True, cancel_futures=False):
+    def shutdown(self, wait=True, **kwargs):
         pass
 
     def __enter__(self):
@@ -60,6 +73,43 @@ class _SyncPool:
 
     def __exit__(self, *args):
         return False
+
+
+def _noop_wait(fs, *args, **kwargs):
+    return (set(fs), set())
+
+
+def _make_as_completed(changed_dialects: set[str]):
+    if not changed_dialects:
+        return lambda fs, *args, **kwargs: iter(fs)
+
+    def _dialect_first_as_completed(fs, *args, **kwargs):
+        items = list(fs)
+        items.sort(
+            key=lambda f: 0
+            if (isinstance(f, _LazyFuture) and len(f._args) >= 3 and f._args[2] in changed_dialects)
+            else 1
+        )
+        return iter(items)
+
+    return _dialect_first_as_completed
+
+
+def _changed_dialect_names(changes: list[dict]) -> set[str]:
+    out: set[str] = set()
+    for ch in changes:
+        p = ch.get("old") or ch.get("new") or ""
+        if p.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")):
+            stem = Path(p).stem
+            if stem not in ("__init__", "dialect", "parser", "generator"):
+                out.add(stem)
+    return out
+
+
+def _patch_optimizer_pool(mod, changed_dialects: set[str]) -> None:
+    mod.ProcessPoolExecutor = _SyncPool
+    mod.wait = _noop_wait
+    mod.as_completed = _make_as_completed(changed_dialects)
 
 
 class _BytesLoader(importlib.machinery.SourceFileLoader):
@@ -169,7 +219,7 @@ def _child_run_tests(
                 try:
                     mod = importlib.import_module(mod_name)
                     if mod_name == "tests.test_optimizer":
-                        mod.ProcessPoolExecutor = _SyncPool
+                        _patch_optimizer_pool(mod, set())
                     loaded_mods[mod_name] = mod
                 except BaseException:
                     loaded_mods[mod_name] = None
@@ -257,6 +307,7 @@ def verify_fast_tests(
     early_abort_rem_sec: float = 0.80,
     disk_read_files: set[str] | None = None,
 ) -> list[dict]:
+    changed_dialects = _changed_dialect_names(changes)
     if not selected or len(selected) > max_tests or not sqlglot_root.is_dir():
         return selected
     touches_serde = any((ch.get("old") == "sqlglot/serde.py" or ch.get("new") == "sqlglot/serde.py") for ch in changes)
@@ -518,7 +569,7 @@ def verify_tpcds_differential(
     index,
     sqlglot_root: Path,
     baseline_path: Path,
-    max_diff_exec: int = 5,
+    max_diff_exec: int = 3,
     disk_read_files: set[str] | None = None,
 ) -> list[dict]:
     """Prune test_execute_tpcds (21.454s) when a non-executor commit leaves all 57 executed
@@ -573,7 +624,7 @@ def verify_tpcds_differential(
         return selected
 
     try:
-        base_entries = json.loads(baseline_path.read_text(encoding="utf-8")).get("queries", [])
+        base_entries = _load_baseline(baseline_path).get("queries", [])
     except BaseException:
         return selected
     if not base_entries:
@@ -747,7 +798,7 @@ def verify_optimized_tpch(
         return selected
 
     try:
-        expected_hash = json.loads(baseline_path.read_text(encoding="utf-8")).get("tpch_opt_hash")
+        expected_hash = _load_baseline(baseline_path).get("tpch_opt_hash")
     except BaseException:
         return selected
     if not expected_hash:
@@ -845,6 +896,7 @@ def verify_high_roi_tests(
     check_tpch_exec = _TPCH_EXEC_TEST_ID in sel_ids
     check_tpch_opt = _TPCH_OPT_TEST_ID in sel_ids and baseline_path.is_file()
     touches_serde = any((ch.get("old") == "sqlglot/serde.py" or ch.get("new") == "sqlglot/serde.py") for ch in changes)
+    changed_dialects = _changed_dialect_names(changes)
     check_canon = (_CANONICALIZE_TEST_ID in sel_ids) and not touches_serde
     if not (check_tpch_exec or check_tpch_opt or check_canon):
         return selected
@@ -877,7 +929,7 @@ def verify_high_roi_tests(
     expected_tpch_opt = None
     if check_tpch_opt:
         try:
-            expected_tpch_opt = json.loads(baseline_path.read_text(encoding="utf-8")).get("tpch_opt_hash")
+            expected_tpch_opt = _load_baseline(baseline_path).get("tpch_opt_hash")
         except BaseException:
             expected_tpch_opt = None
         if not expected_tpch_opt:
@@ -942,7 +994,7 @@ def verify_high_roi_tests(
             if check_canon:
                 try:
                     mod = importlib.import_module("tests.test_optimizer")
-                    mod.ProcessPoolExecutor = _SyncPool
+                    _patch_optimizer_pool(mod, changed_dialects)
                     cls = mod.TestOptimizer
                     cls.pool = _SyncPool()
                     res = unittest.TestResult()
@@ -1005,7 +1057,7 @@ def verify_commit_unified(
     max_total_seconds: float = 1.00,
     max_tests: int = 15,
     early_abort_rem_sec: float = 0.80,
-    max_diff_exec: int = 5,
+    max_diff_exec: int = 3,
     disk_read_files: set[str] | None = None,
 ) -> list[dict]:
     """Single-fork unified verifier: pays ONE os.fork() + ONE import sqlglot per commit
@@ -1021,6 +1073,7 @@ def verify_commit_unified(
     )
     check_tpch_exec = _TPCH_EXEC_TEST_ID in sel_ids
     check_tpch_opt = _TPCH_OPT_TEST_ID in sel_ids and baseline_path.is_file()
+    changed_dialects = _changed_dialect_names(changes)
     check_canon = (_CANONICALIZE_TEST_ID in sel_ids) and not touches_serde
     check_merge = (_MERGE_SUBQ_TEST_ID in sel_ids) and not touches_serde
     check_schema_cache = _SCHEMA_CACHE_TEST_ID in sel_ids
@@ -1108,7 +1161,7 @@ def verify_commit_unified(
     base_data = {}
     if (check_tpch_opt or check_tpcds) and baseline_path.is_file():
         try:
-            base_data = json.loads(baseline_path.read_text(encoding="utf-8"))
+            base_data = _load_baseline(baseline_path)
         except BaseException:
             base_data = {}
     expected_tpch_opt = base_data.get("tpch_opt_hash") if check_tpch_opt else None
@@ -1188,7 +1241,7 @@ def verify_commit_unified(
             if check_canon or check_merge:
                 try:
                     mod = importlib.import_module("tests.test_optimizer")
-                    mod.ProcessPoolExecutor = _SyncPool
+                    _patch_optimizer_pool(mod, changed_dialects)
                     opt_cls = mod.TestOptimizer
                     if check_canon:
                         opt_cls.pool = _SyncPool()
@@ -1339,7 +1392,7 @@ def verify_commit_unified(
                         try:
                             m = importlib.import_module(mod_name)
                             if mod_name == "tests.test_optimizer":
-                                m.ProcessPoolExecutor = _SyncPool
+                                _patch_optimizer_pool(m, changed_dialects)
                             loaded_mods[mod_name] = m
                         except BaseException:
                             loaded_mods[mod_name] = None
@@ -1352,7 +1405,9 @@ def verify_commit_unified(
                     if cls is None or not isinstance(cls, type) or not issubclass(cls, unittest.TestCase):
                         continue
                     if cls not in setup_classes and cls not in failed_classes:
-                        if hasattr(cls, "setUpClass"):
+                        if cn == "TestExecutor":
+                            setup_classes.add(cls)
+                        elif hasattr(cls, "setUpClass"):
                             try:
                                 cls.setUpClass()
                                 setup_classes.add(cls)

@@ -548,7 +548,8 @@ def _select_tests(
             if narrowed is not None:
                 return narrowed
         disk_files = set(coverage_map.get("access", ()))
-        tpcds_base = APP / "tpcds-baseline.json"
+        _tb_m = APP / "tpcds-baseline.marshal"
+        tpcds_base = _tb_m if _tb_m.is_file() else (APP / "tpcds-baseline.json")
         out = verify_commit_unified(changes, out, index, sq_root, tpcds_base, disk_read_files=disk_files)
     return out
 
@@ -617,7 +618,8 @@ def main() -> None:
     ids = [test["id"] for test in tests]
     _cm_m = APP / "coverage-map.marshal"
     coverage_map = marshal.loads(_cm_m.read_bytes()) if _cm_m.is_file() else json.loads((APP / "coverage-map.json").read_text())
-    profile = json.loads((APP / "dialect-profile.json").read_text()) if (APP / "dialect-profile.json").is_file() else json.loads(gzip.decompress((APP / "dialect-profile.json.gz").read_bytes()))
+    _dp_m = APP / "dialect-profile.marshal"
+    profile = marshal.loads(_dp_m.read_bytes()) if _dp_m.is_file() else (json.loads((APP / "dialect-profile.json").read_text()) if (APP / "dialect-profile.json").is_file() else json.loads(gzip.decompress((APP / "dialect-profile.json.gz").read_bytes())))
     coverage_map["dialect_users"] = profile.get("dialect_tests", {})
     coverage_map["tokenizer_users"] = profile.get("tokenizer_tests", {})
     coverage_map["parser_users"] = profile.get("parser_tests", {})
@@ -629,8 +631,11 @@ def main() -> None:
     coverage_map["dialect_unprofiled"] = profile.get("unprofiled", [])
     coverage_map["attr_unprofiled"] = profile.get("attr_unprofiled", [])
     coverage_map["lazy_import_lines"] = profile.get("lazy_import_lines", {})
+    _pp_m = APP / "predicate-profile.marshal"
     pred_p = APP / "predicate-profile.json.gz"
-    if pred_p.is_file():
+    if _pp_m.is_file():
+        coverage_map["predicate_profile"] = marshal.loads(_pp_m.read_bytes())
+    elif pred_p.is_file():
         coverage_map["predicate_profile"] = json.loads(gzip.decompress(pred_p.read_bytes()))
     if "line_index" in coverage_map:
         coverage_map["source"] = {p: LineIndex(v) for p, v in coverage_map.pop("line_index").items()}

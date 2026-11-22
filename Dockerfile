@@ -20,5 +20,9 @@ COPY --from=source /sqlglot/sqlglot /app/sqlglot_src/sqlglot
 COPY --from=source /sqlglot/tests /app/sqlglot_src/tests
 COPY selector.py source_analysis.py coverage_index.py fast_verifier.py verify_fast.py predicate_eval.py build_tpcds_baseline.py /app/
 RUN python -B /app/build_tpcds_baseline.py /app/sqlglot_src /app/tpcds-baseline.json && python -B -c "import json, marshal; from pathlib import Path; Path('/app/coverage-map.marshal').write_bytes(marshal.dumps(json.loads(Path('/app/coverage-map.json').read_bytes())))"
+RUN python -c "import gzip, json, marshal, pathlib; \
+  [pathlib.Path(dst).write_bytes(marshal.dumps(json.loads(gzip.decompress(pathlib.Path(src).read_bytes())) if src.endswith('.gz') else json.loads(pathlib.Path(src).read_text()))) \
+   for src, dst in [('/app/dialect-profile.json.gz','/app/dialect-profile.marshal'),('/app/predicate-profile.json.gz','/app/predicate-profile.marshal'),('/app/tpcds-baseline.json','/app/tpcds-baseline.marshal')] \
+   if pathlib.Path(src).is_file()]"
 RUN python -m compileall -q /app /app/sqlglot_src && chmod -R a+rX /app
 CMD ["python", "-B", "/app/selector.py"]
