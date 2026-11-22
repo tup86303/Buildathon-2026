@@ -542,7 +542,7 @@ def _select_tests(
                     extra_keep.update(_file_tests(p, coverage_map))
                     if p.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")):
                         d_name = Path(p).stem
-                        d_tests = coverage_map.get("dialect_tests", {})
+                        d_tests = coverage_map.get("dialect_users", {})
                         extra_keep.update(d_tests.get(d_name, ()))
                         for sub_d in getattr(index, "dialect_subclasses", {}).get(d_name, ()):
                             extra_keep.update(d_tests.get(sub_d, ()))
